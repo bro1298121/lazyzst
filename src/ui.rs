@@ -1,14 +1,14 @@
 use std::{fs, path::Path};
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
-use crate::app::{App, VISIBLE_ROWS};
+use crate::app::{App, Dialog, VISIBLE_ROWS};
 
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -137,21 +137,8 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(info_text, mid_chunks[1]);
 
-    // 底部：键位提示
-    let keys = vec![
-        Span::styled(" z:tar ", Style::default().fg(Color::Cyan)),
-        Span::styled(" x:zip ", Style::default().fg(Color::Green)),
-        Span::styled(" c:wim ", Style::default().fg(Color::Yellow)),
-        Span::styled(" v:7z ", Style::default().fg(Color::Magenta)),
-        Span::styled(" b:zst ", Style::default().fg(Color::Red)),
-        Span::styled(" n:gz ", Style::default().fg(Color::Blue)),
-        Span::styled(" m:xz ", Style::default().fg(Color::LightRed)),
-        Span::styled(" | Enter:进入 ", Style::default().fg(Color::White)),
-        Span::styled(" Backspace:返回 ", Style::default().fg(Color::White)),
-        Span::styled(" q:退出 ", Style::default().fg(Color::White)),
-    ];
-
-    let key_hint = Paragraph::new(Line::from(keys))
+    // 底部：键位提示。一行放不下时按优先级砍掉靠后的导航提示（见 key_hint_line）
+    let key_hint = Paragraph::new(key_hint_line(chunks[2].width as usize))
         .block(Block::default().borders(Borders::ALL).title("键位"));
 
     f.render_widget(key_hint, chunks[2]);
@@ -203,6 +190,206 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     };
 
     f.render_widget(gauge, chunks[3]);
+
+    // 弹窗画在最后：整屏先压暗，再叠上居中的确认框
+    if let Some(dialog) = app.dialog.as_ref() {
+        render_dialog(f, dialog);
+    }
+}
+
+/// 键位提示行。压缩键和 d 永远保留，导航提示按重要性依次往后砍，
+/// 保证一行之内放得下；渲染顺序始终是下表的先后顺序
+fn key_hint_line(width: usize) -> Line<'static> {
+    // (tier, 片段)：tier 越小越先占位，放不下的整组直接跳过
+    let groups: [(u8, Vec<Span<'static>>); 5] = [
+        (
+            0,
+            vec![
+                Span::styled(" z:tar ", Style::default().fg(Color::Cyan)),
+                Span::styled(" x:zip ", Style::default().fg(Color::Green)),
+                Span::styled(" c:wim ", Style::default().fg(Color::Yellow)),
+                Span::styled(" v:7z ", Style::default().fg(Color::Magenta)),
+                Span::styled(" b:zst ", Style::default().fg(Color::Red)),
+                Span::styled(" n:gz ", Style::default().fg(Color::Blue)),
+                Span::styled(" m:xz ", Style::default().fg(Color::LightRed)),
+            ],
+        ),
+        (
+            0,
+            vec![Span::styled(
+                " | d:删除 ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )],
+        ),
+        (1, vec![Span::styled(" Enter:进入 ", Style::default().fg(Color::White))]),
+        (2, vec![Span::styled(" q:退出 ", Style::default().fg(Color::White))]),
+        (3, vec![Span::styled(
+            " Backspace:返回 ",
+            Style::default().fg(Color::White),
+        )]),
+    ];
+
+    // 边框吃掉两列
+    let budget = width.saturating_sub(2);
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by_key(|&i| groups[i].0);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for i in order {
+        let (_, group) = &groups[i];
+        let w: usize = group.iter().map(|s| display_width(&s.content)).sum();
+        if used + w <= budget {
+            used += w;
+            spans.extend(group.iter().cloned());
+        }
+    }
+    // 终端窄到一组都塞不下时，至少留一个最小的删除键提示
+    if spans.is_empty() {
+        for chip in [" d ", "d"] {
+            if display_width(chip) <= budget {
+                spans.push(Span::styled(
+                    chip,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+                break;
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// 在 area 里居中一个给定尺寸的框，尺寸先被 area 夹住，不会溢出屏幕
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// 弹窗遮罩：保留字符形状，只把前景压成暗灰、背景刷黑，
+/// 底层界面退成一层余影，焦点清楚地交给弹窗
+fn dim_underlay(f: &mut Frame) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_fg(Color::DarkGray).set_bg(Color::Black);
+            }
+        }
+    }
+}
+
+/// 删除确认弹窗。不可逆操作，所以：目标路径完整换行显示（绝不省略）、
+/// 文案区分文件与目录、Enter / Esc 两种退路都写在框里
+fn render_dialog(f: &mut Frame, dialog: &Dialog) {
+    dim_underlay(f);
+
+    let target = dialog.target.display().to_string();
+    let (icon, danger, question) = if dialog.is_dir {
+        ("📁", "🚨 永久删除，目录里的所有内容都会消失", "确定要删除这个目录吗?")
+    } else {
+        ("📄", "🚨 永久删除，无法撤销", "确定要删除这个文件吗?")
+    };
+
+    // 框宽夹在 24~66 列之间，再按路径实际宽度算出需要几行
+    let area = f.area();
+    let w = area.width.min(66).max(area.width.min(24));
+    // 路径可用宽度：去掉边框 2 列和左右留白 4 列
+    let inner_w = w.saturating_sub(6).max(1) as usize;
+    // 路径独占一整块宽度，按它算出要几行才能完整显示
+    let path_rows = display_width(&target).div_ceil(inner_w).max(1);
+    // 边框 2 行 + 上下留白 2 行 + 危险 / 问句 / 空行 / 目标标签 / 空行 / 按键 6 行
+    let wanted_h = (10 + path_rows as u16).min(22);
+    let popup = centered(area, w, wanted_h);
+
+    // Clear 清掉这块区域的字符和样式，底层界面的残影不会从框里透出来
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(Color::Indexed(235)))
+        .title(Span::styled(
+            " 删除确认 ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(popup).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // 危险提示
+            Constraint::Length(1), // 问句
+            Constraint::Length(1), // 空行
+            Constraint::Length(1), // 目标标签
+            Constraint::Min(1),    // 目标路径，完整显示、换行
+            Constraint::Length(1), // 空行
+            Constraint::Length(1), // 按键提示
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{} ", icon), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                danger,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            question,
+            Style::default().fg(Color::White),
+        )])),
+        rows[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "目标",
+            Style::default().fg(Color::Cyan),
+        )])),
+        rows[3],
+    );
+
+    // 完整路径：宁可换行也不省略，省略了就可能删错文件
+    f.render_widget(
+        Paragraph::new(target)
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .wrap(Wrap { trim: true }),
+        rows[4],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Enter ",
+                Style::default().fg(Color::White).bg(Color::Red),
+            ),
+            Span::styled(" 确认删除 ", Style::default().fg(Color::Red)),
+            Span::styled(
+                "  Esc ",
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Span::styled(" 取消 ", Style::default().fg(Color::DarkGray)),
+        ])),
+        rows[6],
+    );
 }
 
 /// 单个字符占用的显示列数：控制字符 0 列，ASCII / 半角 1 列，
@@ -332,7 +519,125 @@ pub(crate) fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::{backend::TestBackend, Terminal};
+
     use super::*;
+    use crate::app::{DialogAction, Dialog};
+
+    /// 渲染一帧并把字符拼成纯文本，方便断言画面内容。
+    /// 宽字符会占掉两格、第二格被重置成空格，这里跳过它才能还原原文
+    fn render(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..h {
+            let mut filler = false;
+            for x in 0..w {
+                let symbol = buf.cell(Position::new(x, y)).unwrap().symbol();
+                if filler {
+                    filler = false;
+                    continue;
+                }
+                out.push_str(symbol);
+                filler = display_width(symbol) == 2;
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn with_dialog(target: &str, is_dir: bool) -> App {
+        let mut app = App::new();
+        app.entries.clear();
+        app.dialog = Some(Dialog {
+            action: DialogAction::Delete,
+            target: PathBuf::from(target),
+            is_dir,
+        });
+        app
+    }
+
+    #[test]
+    fn key_hint_never_overflows_its_row() {
+        for width in [4usize, 10, 20, 40, 56, 70, 78, 80, 100, 120, 200] {
+            let line = key_hint_line(width);
+            let w: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+            // 边框占掉两列，提示必须落在那一行里
+            assert!(w <= width.saturating_sub(2), "width={width} 实际={w}");
+        }
+        // 宽终端下压缩键与 d 都在
+        let full = key_hint_line(120);
+        let text: String = full.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("z:tar") && text.contains("d:删除"), "{text}");
+    }
+
+    /// 取出弹窗内容区的一行：去掉两侧竖边框与空白，宽字符的第二格也算空白
+    fn box_line(row: &str) -> String {
+        row.split('║')
+            .nth(1)
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn dialog_names_the_kind_and_shows_the_full_path() {
+        let long = r"D:\工作目录\很长的中文目录名\子目录\子目录\更深的子目录\报告.tar";
+        let screen = render(&mut with_dialog(long, true), 100, 24);
+
+        assert!(screen.contains("确定要删除这个目录吗?"), "目录要用目录的说法");
+        assert!(screen.contains("Enter") && screen.contains("Esc"), "两种退路都要写在框里");
+
+        // 路径太长会被弹窗自动换行，逐行拼起来必须正好是完整路径：
+        // 少一个字符就是被截断，多一个就是省略号顶替了
+        let lines: Vec<String> = screen.lines().map(box_line).collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("D:\\"))
+            .expect("弹窗里应显示目标路径");
+        let mut joined = String::new();
+        for line in &lines[start..] {
+            if line.is_empty() {
+                break; // 路径区结束
+            }
+            joined.push_str(line);
+            if joined.chars().count() >= long.chars().count() {
+                break;
+            }
+        }
+        assert_eq!(joined, long, "路径必须完整换行显示");
+        // 省略后的形态绝不能出现，省略了就可能删错文件
+        assert!(
+            !screen.contains(&elide_path(Path::new(long), 40)),
+            "弹窗不能省略路径"
+        );
+    }
+
+    #[test]
+    fn dialog_for_a_file_asks_about_a_file() {
+        let short = r"D:\a\b.txt";
+        let screen = render(&mut with_dialog(short, false), 80, 20);
+        assert!(screen.contains("确定要删除这个文件吗?"), "文件要用文件的说法");
+        assert!(screen.contains(short), "{screen}");
+    }
+
+    #[test]
+    fn dialog_renders_on_tiny_terminals_without_panicking() {
+        // 弹窗尺寸被终端夹住，极端尺寸只要求不崩
+        for (w, h) in [(12u16, 6u16), (20, 4), (30, 10), (200, 60)] {
+            let mut app = with_dialog(r"D:\very\long\path\to\a\file.txt", false);
+            let screen = render(&mut app, w, h);
+            assert_eq!(
+                screen.lines().count(),
+                h as usize,
+                "{w}x{h} 渲染行数不对"
+            );
+        }
+    }
 
     #[test]
     fn width_counts_ascii_cjk_and_emoji_as_columns() {

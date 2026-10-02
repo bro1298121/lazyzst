@@ -56,42 +56,53 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             if !matches!(key.kind, KeyEventKind::Press) {
                 continue;
             }
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if app.selected + 1 < app.entries.len() {
-                        app.selected += 1;
-                        if app.selected >= app.scroll_offset + VISIBLE_ROWS {
-                            app.scroll_offset += 1;
+            // 弹窗是模态的：焦点在弹窗上，只有 Enter / Esc 能穿透，
+            // 其余按键（含 q 和 z~m）一律吞掉，避免误触直接删掉或退出程序
+            if app.dialog.is_some() {
+                match key.code {
+                    KeyCode::Enter => app.confirm_dialog(),
+                    KeyCode::Esc => app.dismiss_dialog(),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if app.selected + 1 < app.entries.len() {
+                            app.selected += 1;
+                            if app.selected >= app.scroll_offset + VISIBLE_ROWS {
+                                app.scroll_offset += 1;
+                            }
                         }
                     }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    if app.selected > 0 {
-                        app.selected -= 1;
-                        if app.selected < app.scroll_offset {
-                            app.scroll_offset -= 1;
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if app.selected > 0 {
+                            app.selected -= 1;
+                            if app.selected < app.scroll_offset {
+                                app.scroll_offset -= 1;
+                            }
                         }
                     }
+                    KeyCode::Enter => app.enter_dir(),
+                    KeyCode::Backspace => app.go_up(),
+                    KeyCode::Char('z') => app.compress("tar"),
+                    KeyCode::Char('x') => app.compress("zip"),
+                    KeyCode::Char('c') => app.compress("wim"),
+                    KeyCode::Char('v') => app.compress("7z"),
+                    KeyCode::Char('b') => app.compress("zst"),
+                    KeyCode::Char('n') => app.compress("gz"),
+                    KeyCode::Char('m') => app.compress("xz"),
+                    KeyCode::Char('d') => app.request_delete(),
+                    KeyCode::Char('h') => {
+                        app.selected = 0;
+                        app.scroll_offset = 0;
+                    }
+                    KeyCode::Char('l') => {
+                        app.selected = app.entries.len().saturating_sub(1);
+                        app.scroll_offset = app.selected.saturating_sub(VISIBLE_ROWS - 1);
+                    }
+                    _ => {}
                 }
-                KeyCode::Enter => app.enter_dir(),
-                KeyCode::Backspace => app.go_up(),
-                KeyCode::Char('z') => app.compress("tar"),
-                KeyCode::Char('x') => app.compress("zip"),
-                KeyCode::Char('c') => app.compress("wim"),
-                KeyCode::Char('v') => app.compress("7z"),
-                KeyCode::Char('b') => app.compress("zst"),
-                KeyCode::Char('n') => app.compress("gz"),
-                KeyCode::Char('m') => app.compress("xz"),
-                KeyCode::Char('h') => {
-                    app.selected = 0;
-                    app.scroll_offset = 0;
-                }
-                KeyCode::Char('l') => {
-                    app.selected = app.entries.len().saturating_sub(1);
-                    app.scroll_offset = app.selected.saturating_sub(VISIBLE_ROWS - 1);
-                }
-                _ => {}
             }
         }
 
