@@ -108,6 +108,10 @@ pub(crate) struct App {
     pub(crate) last_out: Option<OutputInfo>,
     /// Modal dialog; while open, keys are limited to Enter / Esc
     pub(crate) dialog: Option<Dialog>,
+    /// Size shown for the selected entry, kept between frames. `ui` redraws on
+    /// a timer and measuring a directory means walking it, so the result is held
+    /// until the selection moves or the listing is refreshed
+    pub(crate) size_cache: Option<(PathBuf, String)>,
 }
 
 impl App {
@@ -126,6 +130,7 @@ impl App {
             job: None,
             last_out: None,
             dialog: None,
+            size_cache: None,
         }
     }
 
@@ -145,6 +150,17 @@ impl App {
         entries
     }
 
+    /// Re-read the listing of the current directory.
+    ///
+    /// Every path that re-reads the listing goes through here so that the
+    /// cached size of the selected entry gets dropped with it; a file that was
+    /// just compressed, extracted or deleted would otherwise keep reporting the
+    /// size it had before the change
+    fn refresh_entries(&mut self) {
+        self.entries = Self::read_dir(&self.current_dir);
+        self.size_cache = None;
+    }
+
     pub(crate) fn enter_dir(&mut self) {
         let entry = self.entries.get(self.selected).cloned();
         if let Some(entry) = entry
@@ -152,7 +168,7 @@ impl App {
         {
             let path = entry.clone();
             self.current_dir = path;
-            self.entries = Self::read_dir(&self.current_dir);
+            self.refresh_entries();
             self.selected = 0;
             self.scroll_offset = 0;
             // Different directory: the previous output is no longer relevant
@@ -165,7 +181,7 @@ impl App {
         let parent = self.current_dir.parent().map(|p| p.to_path_buf());
         if let Some(parent) = parent {
             self.current_dir = parent.clone();
-            self.entries = Self::read_dir(&self.current_dir);
+            self.refresh_entries();
             self.selected = 0;
             self.scroll_offset = 0;
             // Different directory: the previous output is no longer relevant
@@ -218,7 +234,7 @@ impl App {
                     Ok(()) => {
                         // One entry is gone: re-read and pull the selection back
                         // into range
-                        self.entries = Self::read_dir(&self.current_dir);
+                        self.refresh_entries();
                         self.clamp_selection();
                         // The previous output info is stale and would cover up
                         // the delete result
@@ -459,7 +475,7 @@ impl App {
                 self.status = fail_msg;
             }
             // The directory gained a new output: re-read it and stay in range
-            self.entries = Self::read_dir(&self.current_dir);
+            self.refresh_entries();
             self.clamp_selection();
             return;
         };
@@ -506,7 +522,7 @@ impl App {
                 ],
             );
         }
-        self.entries = Self::read_dir(&self.current_dir);
+        self.refresh_entries();
         self.clamp_selection();
     }
 
