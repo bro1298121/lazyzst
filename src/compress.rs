@@ -6,25 +6,46 @@ use std::{
 
 use anyhow::Result;
 
-/// 各格式的：产物扩展名 / 成功文案前缀 / 失败文案
-pub(crate) fn format_spec(format: &str) -> (&'static str, &'static str, &'static str) {
+use crate::i18n::Lang;
+
+/// Output file extension per format
+pub(crate) fn output_ext(format: &str) -> &'static str {
     match format {
-        "tar" => ("tar", "已打包", "tar 打包失败"),
-        "zip" => ("zip", "已压缩", "zip 压缩失败"),
-        "wim" => ("wim", "已压缩", "wim 压缩失败（需要管理员权限）"),
-        "7z" => ("7z", "已压缩", "7z 压缩失败"),
-        "zst" => ("zst", "已压缩", "zst 压缩失败"),
-        "gz" => ("gz", "已压缩", "gz 压缩失败"),
-        "xz" => ("xz", "已压缩", "xz 压缩失败"),
+        "tar" => "tar",
+        "zip" => "zip",
+        "wim" => "wim",
+        "7z" => "7z",
+        "zst" => "zst",
+        "gz" => "gz",
+        "xz" => "xz",
         _ => unreachable!(),
     }
 }
 
-/// 按格式拼出未启动的命令与产物路径；gz / xz 预先建好产物文件，
-/// 这样创建失败能立刻报错，而不会变成一个跑失败的子进程
+/// Success prefix and failure message for a format, localized through `lang`.
+///
+/// Still a pure lookup: no filesystem, no process, no state. `lang.t` never
+/// panics and falls back to `en-us` and then to the key, so an unknown key
+/// shows up as `compress.tar.fail` rather than as a crash.
+pub(crate) fn format_spec(lang: &Lang, format: &str) -> (String, String) {
+    let (ok_key, fail_key) = match format {
+        "tar" => ("compress.tar.ok", "compress.tar.fail"),
+        "zip" => ("compress.zip.ok", "compress.zip.fail"),
+        "wim" => ("compress.wim.ok", "compress.wim.fail"),
+        "7z" => ("compress.7z.ok", "compress.7z.fail"),
+        "zst" => ("compress.zst.ok", "compress.zst.fail"),
+        "gz" => ("compress.gz.ok", "compress.gz.fail"),
+        "xz" => ("compress.xz.ok", "compress.xz.fail"),
+        _ => unreachable!(),
+    };
+    (lang.t(ok_key), lang.t(fail_key))
+}
+
+/// Assemble the not-yet-started command and output path for a format.
+/// gz / xz create the output file up front, so a failure to create it is
+/// reported right away instead of turning into a child process that runs and fails
 pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathBuf)> {
-    let (ext, _, _) = format_spec(format);
-    let out = path.with_extension(ext);
+    let out = path.with_extension(output_ext(format));
 
     let mut cmd = match format {
         "tar" => {
@@ -77,12 +98,51 @@ pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathB
         _ => unreachable!(),
     };
 
-    // gz / xz 的 stdout 已重定向到产物文件，其余格式一律丢弃输出：
-    // 否则 7z / zstd / dism 的进度输出会直接打进 TUI 画面，撕裂界面和进度条
+    // gz / xz already redirect stdout into the output file; every other format
+    // discards its output: otherwise the progress chatter from 7z / zstd / dism
+    // lands straight in the TUI and shreds the screen and the progress bar
     if !matches!(format, "gz" | "xz") {
         cmd.stdout(Stdio::null());
     }
     cmd.stderr(Stdio::null());
 
     Ok((cmd, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FORMATS: [&str; 7] = ["tar", "zip", "wim", "7z", "zst", "gz", "xz"];
+
+    #[test]
+    fn every_format_has_copy_in_every_language() {
+        // A typo in a key would silently render as the key itself (the last
+        // step of the fallback chain), so assert we never get a dotted key back
+        for tag in ["zh-cn", "zh-tw", "en-us"] {
+            let mut lang = Lang::builtin();
+            lang.current = tag.to_string();
+            for format in FORMATS {
+                let (ok, fail) = format_spec(&lang, format);
+                assert!(!ok.starts_with("compress."), "{tag}/{format} ok={ok}");
+                assert!(!fail.starts_with("compress."), "{tag}/{format} fail={fail}");
+                assert!(!ok.is_empty() && !fail.is_empty(), "{tag}/{format}");
+                assert_eq!(output_ext(format), format);
+            }
+        }
+    }
+
+    #[test]
+    fn tar_is_described_as_packing_while_the_rest_say_compressing() {
+        let lang = Lang::builtin();
+        assert_eq!(format_spec(&lang, "tar").0, "Packed");
+        assert_eq!(format_spec(&lang, "zst").0, "Compressed");
+    }
+
+    #[test]
+    fn wim_keeps_the_administrator_hint() {
+        let lang = Lang::builtin();
+        let (_, fail) = format_spec(&lang, "wim");
+        assert!(fail.contains("administrator"), "{fail}");
+    }
 }

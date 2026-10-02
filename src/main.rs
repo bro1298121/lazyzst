@@ -1,5 +1,6 @@
 mod app;
 mod compress;
+mod i18n;
 mod ui;
 
 use std::time::Instant;
@@ -17,17 +18,25 @@ use ratatui::{
 
 use crate::{
     app::{App, TICK, VISIBLE_ROWS},
+    i18n::Lang,
     ui::ui,
 };
 
 fn main() -> Result<()> {
+    // Read the language before the alternate screen goes up: a broken config
+    // degrades to the built-in copy and says so in the status bar
+    let (lang, notice) = Lang::load();
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(lang);
+    if let Some(notice) = notice {
+        app.status = notice;
+    }
     let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -39,7 +48,8 @@ fn main() -> Result<()> {
 
 fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let result = event_loop(terminal, app);
-    // 正常退出或中途出错，都要在离开 alternate screen 前回收子进程
+    // Whether we quit normally or bail out mid-loop, reap the child process
+    // before leaving the alternate screen
     app.cancel_job();
     result
 }
@@ -49,15 +59,17 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        // 等待下一次节拍，期间仍可响应按键
+        // Sleep until the next tick while still answering key presses
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? && let Event::Key(key) = event::read()? {
-            // Windows 上一次物理按键会同时产生 Press 与 Release，只处理 Press
+            // One physical key press produces both a Press and a Release event
+            // on Windows; act on the Press only
             if !matches!(key.kind, KeyEventKind::Press) {
                 continue;
             }
-            // 弹窗是模态的：焦点在弹窗上，只有 Enter / Esc 能穿透，
-            // 其余按键（含 q 和 z~m）一律吞掉，避免误触直接删掉或退出程序
+            // The dialog is modal: focus belongs to it, only Enter / Esc get
+            // through. Every other key (q and z..m included) is swallowed so a
+            // stray press cannot delete anything or quit the program
             if app.dialog.is_some() {
                 match key.code {
                     KeyCode::Enter => app.confirm_dialog(),
@@ -106,7 +118,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             }
         }
 
-        // 到点：推进进度动画并收取后台任务结果
+        // Tick reached: advance the progress animation and collect the job result
         if last_tick.elapsed() >= TICK {
             last_tick = Instant::now();
             app.tick_job();

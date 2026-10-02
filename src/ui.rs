@@ -8,9 +8,16 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Dialog, VISIBLE_ROWS};
+use crate::{
+    app::{App, Dialog, VISIBLE_ROWS},
+    i18n::Lang,
+};
 
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
+    // Every label below comes from the table; `app` is only read here, so the
+    // borrow can live for the whole frame
+    let lang = &app.lang;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -21,7 +28,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // 顶部：当前路径
+    // Top: current path
     let path_text = Paragraph::new(Line::from(vec![
         Span::styled("📁 ", Style::default().fg(Color::Cyan)),
         Span::styled(
@@ -29,18 +36,18 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::White),
         ),
     ]))
-    .block(Block::default().borders(Borders::ALL).title("路径"))
+    .block(Block::default().borders(Borders::ALL).title(lang.t("panel.path")))
     .style(Style::default().fg(Color::White));
 
     f.render_widget(path_text, chunks[0]);
 
-    // 中部：左右分栏
+    // Middle: split into two columns
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(chunks[1]);
 
-    // 左：文件树
+    // Left: file tree
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -70,7 +77,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .collect();
 
     let file_list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("文件树"))
+        .block(Block::default().borders(Borders::ALL).title(lang.t("panel.tree")))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -80,9 +87,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(file_list, mid_chunks[0]);
 
-    // 右：文件信息
+    // Right: file info
     let info_text = if let Some(path) = app.get_selected_path() {
-        // 读不到 metadata 就显示"未知"，不伪造大小和时间
+        // An unreadable metadata shows as "unknown": never invent a size or time
         let (size, modified) = match fs::metadata(&path) {
             Ok(meta) => (
                 format_size(meta.len()),
@@ -91,59 +98,64 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
                         let dt: chrono::DateTime<chrono::Local> = t.into();
                         dt.format("%Y-%m-%d %H:%M:%S").to_string()
                     })
-                    .unwrap_or_else(|_| "未知".to_string()),
+                    .unwrap_or_else(|_| lang.t("value.unknown")),
             ),
-            Err(_) => ("未知".to_string(), "未知".to_string()),
+            Err(_) => (
+                lang.t("value.unknown"),
+                lang.t("value.unknown"),
+            ),
         };
 
+        let label = |key: &str| Span::styled(format!("{} ", lang.t(key)), Style::default().fg(Color::Cyan));
+        let kind = if path.is_dir() {
+            lang.t("value.dir")
+        } else {
+            lang.t("value.file")
+        };
         let lines = vec![
             Line::from(vec![
-                Span::styled("名称: ", Style::default().fg(Color::Cyan)),
+                label("info.name"),
                 Span::styled(
                     path.file_name().unwrap_or_default().to_string_lossy().to_string(),
                     Style::default().fg(Color::White),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("类型: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    if path.is_dir() { "目录" } else { "文件" },
-                    Style::default().fg(Color::White),
-                ),
+                label("info.type"),
+                Span::styled(kind, Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
-                Span::styled("大小: ", Style::default().fg(Color::Cyan)),
+                label("info.size"),
                 Span::styled(size, Style::default().fg(Color::White)),
             ]),
             Line::from(vec![
-                Span::styled("修改时间: ", Style::default().fg(Color::Cyan)),
+                label("info.mtime"),
                 Span::styled(modified, Style::default().fg(Color::White)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("完整路径: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    path.display().to_string(),
-                    Style::default().fg(Color::Yellow),
-                ),
+                label("info.full_path"),
+                Span::styled(path.display().to_string(), Style::default().fg(Color::Yellow)),
             ]),
         ];
         Paragraph::new(lines)
     } else {
-        Paragraph::new("没有选中项目")
+        Paragraph::new(lang.t("info.empty"))
     }
-    .block(Block::default().borders(Borders::ALL).title("文件信息"))
+    .block(Block::default().borders(Borders::ALL).title(lang.t("panel.info")))
     .wrap(Wrap { trim: true });
 
     f.render_widget(info_text, mid_chunks[1]);
 
-    // 底部：键位提示。一行放不下时按优先级砍掉靠后的导航提示（见 key_hint_line）
-    let key_hint = Paragraph::new(key_hint_line(chunks[2].width as usize))
-        .block(Block::default().borders(Borders::ALL).title("键位"));
+    // Bottom: key hints. When a single row runs out of space the lower-priority
+    // navigation hints get dropped (see key_hint_line)
+    let key_hint = Paragraph::new(key_hint_line(lang, chunks[2].width as usize))
+        .block(Block::default().borders(Borders::ALL).title(lang.t("panel.keys")));
 
     f.render_widget(key_hint, chunks[2]);
 
-    // 底部：进度 / 状态，独占一行，不会和上面任何 widget 重叠
+    // Bottom: progress / status, owning its own row so it never overlaps the
+    // widgets above
     let gauge = match app.job.as_ref() {
         Some(job) => {
             let name = job
@@ -152,34 +164,32 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
+            let secs = job.started.elapsed().as_secs().to_string();
             Gauge::default()
                 .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
                 .style(Style::default().bg(Color::DarkGray))
                 .label(Span::styled(
-                    format!(
-                        "压缩中: {} {} (已用 {}s)",
-                        job.format,
-                        name,
-                        job.started.elapsed().as_secs()
-                    ),
+                    lang.tf("status.compressing", &[&job.format, &name, &secs]),
                     Style::default().fg(Color::White),
                 ))
                 .ratio(f64::from(job.progress) / 100.0)
         }
         None => {
-            // 有最近产物时按实际宽度拼装，放不下就把路径省略成 盘符:\...文件名.格式
+            // With a recent output, assemble the label against the real width;
+            // when it does not fit, elide the path to  drive:\...name.ext
             let text = match app.last_out.as_ref() {
                 Some(o) => {
                     let area = chunks[3];
-                    let head = format!("状态: {}: ", o.prefix);
-                    let tail = format!("  大小: {}", o.size);
+                    let head = format!("{} {}: ", lang.t("status.label"), o.prefix);
+                    let tail = format!("  {} {}", lang.t("status.size_field"), o.size);
                     let fixed = display_width(&head) + display_width(&tail);
                     let budget = (area.width as usize).saturating_sub(fixed);
                     let path = elide_path(&o.path, budget);
-                    // 定长片段本身就超宽时（例如大小文案特别长）再兜底截一次
+                    // Truncate once more when the fixed parts alone are already
+                    // too wide (an unusually long size string, say)
                     truncate_to_width(&format!("{}{}{}", head, path, tail), area.width as usize)
                 }
-                None => format!("状态: {}", app.status),
+                None => format!("{} {}", lang.t("status.label"), app.status),
             };
             Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
@@ -191,16 +201,23 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(gauge, chunks[3]);
 
-    // 弹窗画在最后：整屏先压暗，再叠上居中的确认框
+    // The dialog is drawn last: dim the whole screen, then stack the centered
+    // confirmation on top
     if let Some(dialog) = app.dialog.as_ref() {
-        render_dialog(f, dialog);
+        render_dialog(f, lang, dialog);
     }
 }
 
-/// 键位提示行。压缩键和 d 永远保留，导航提示按重要性依次往后砍，
-/// 保证一行之内放得下；渲染顺序始终是下表的先后顺序
-fn key_hint_line(width: usize) -> Line<'static> {
-    // (tier, 片段)：tier 越小越先占位，放不下的整组直接跳过
+/// Key hint row. The compression keys and `d` always stay; the navigation
+/// hints get dropped in order of importance, which keeps everything inside one
+/// row. The render order always follows the order of the table below
+fn key_hint_line(lang: &Lang, width: usize) -> Line<'static> {
+    // " <key>:<label> " chip; the key letter and the padding are layout, not copy
+    let chip = |key: &str, label: &str, style: Style| {
+        Span::styled(format!(" {key}:{} ", lang.t(label)), style)
+    };
+    // (tier, group): a lower tier claims space first, and a group that does not
+    // fit is skipped whole
     let groups: [(u8, Vec<Span<'static>>); 5] = [
         (
             0,
@@ -216,20 +233,27 @@ fn key_hint_line(width: usize) -> Line<'static> {
         ),
         (
             0,
+            // The pipe is a layout separator between the two groups, not copy
             vec![Span::styled(
-                " | d:删除 ",
+                format!(" | d:{} ", lang.t("key.delete")),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )],
         ),
-        (1, vec![Span::styled(" Enter:进入 ", Style::default().fg(Color::White))]),
-        (2, vec![Span::styled(" q:退出 ", Style::default().fg(Color::White))]),
-        (3, vec![Span::styled(
-            " Backspace:返回 ",
-            Style::default().fg(Color::White),
-        )]),
+        (
+            1,
+            vec![chip("Enter", "key.enter", Style::default().fg(Color::White))],
+        ),
+        (
+            2,
+            vec![chip("q", "key.quit", Style::default().fg(Color::White))],
+        ),
+        (
+            3,
+            vec![chip("Backspace", "key.back", Style::default().fg(Color::White))],
+        ),
     ];
 
-    // 边框吃掉两列
+    // The border eats two columns
     let budget = width.saturating_sub(2);
     let mut order: Vec<usize> = (0..groups.len()).collect();
     order.sort_by_key(|&i| groups[i].0);
@@ -244,12 +268,14 @@ fn key_hint_line(width: usize) -> Line<'static> {
             spans.extend(group.iter().cloned());
         }
     }
-    // 终端窄到一组都塞不下时，至少留一个最小的删除键提示
+    // When the terminal is too narrow for even one group, keep the smallest
+    // possible delete hint
     if spans.is_empty() {
-        for chip in [" d ", "d"] {
-            if display_width(chip) <= budget {
+        let letter = lang.t("key.delete_tiny");
+        for text in [format!(" {} ", letter), letter] {
+            if display_width(&text) <= budget {
                 spans.push(Span::styled(
-                    chip,
+                    text,
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
                 break;
@@ -259,7 +285,8 @@ fn key_hint_line(width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 在 area 里居中一个给定尺寸的框，尺寸先被 area 夹住，不会溢出屏幕
+/// Center a box of the given size inside `area`; the size is clamped to the
+/// area first, so it can never spill off screen
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -271,8 +298,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// 弹窗遮罩：保留字符形状，只把前景压成暗灰、背景刷黑，
-/// 底层界面退成一层余影，焦点清楚地交给弹窗
+/// Dialog mask: keeps the glyph shapes but flattens the foreground to dark grey
+/// over a black background, so the screen behind reads as a shadow and focus
+/// clearly belongs to the dialog
 fn dim_underlay(f: &mut Frame) {
     let area = f.area();
     let buf = f.buffer_mut();
@@ -285,30 +313,42 @@ fn dim_underlay(f: &mut Frame) {
     }
 }
 
-/// 删除确认弹窗。不可逆操作，所以：目标路径完整换行显示（绝不省略）、
-/// 文案区分文件与目录、Enter / Esc 两种退路都写在框里
-fn render_dialog(f: &mut Frame, dialog: &Dialog) {
+/// Delete confirmation dialog. The action is irreversible, so: the full target
+/// path is shown (never elided), the wording distinguishes file from directory,
+/// and both ways out (Enter / Esc) are spelled out inside the box
+fn render_dialog(f: &mut Frame, lang: &Lang, dialog: &Dialog) {
     dim_underlay(f);
 
     let target = dialog.target.display().to_string();
     let (icon, danger, question) = if dialog.is_dir {
-        ("📁", "🚨 永久删除，目录里的所有内容都会消失", "确定要删除这个目录吗?")
+        (
+            "📁",
+            lang.t("dialog.danger_dir"),
+            lang.t("dialog.question_dir"),
+        )
     } else {
-        ("📄", "🚨 永久删除，无法撤销", "确定要删除这个文件吗?")
+        (
+            "📄",
+            lang.t("dialog.danger_file"),
+            lang.t("dialog.question_file"),
+        )
     };
 
-    // 框宽夹在 24~66 列之间，再按路径实际宽度算出需要几行
+    // Clamp the width to 24..=66 columns, then derive how many rows the path
+    // actually needs from its real width
     let area = f.area();
     let w = area.width.min(66).max(area.width.min(24));
-    // 路径可用宽度：去掉边框 2 列和左右留白 4 列
+    // Usable width for the path: minus 2 border columns and 4 columns of padding
     let inner_w = w.saturating_sub(6).max(1) as usize;
-    // 路径独占一整块宽度，按它算出要几行才能完整显示
+    // The path gets a full-width block; that is what decides the row count
     let path_rows = display_width(&target).div_ceil(inner_w).max(1);
-    // 边框 2 行 + 上下留白 2 行 + 危险 / 问句 / 空行 / 目标标签 / 空行 / 按键 6 行
+    // 2 border rows + 2 rows of vertical padding + 6 rows for danger / question /
+    // blank / target label / blank / keys
     let wanted_h = (10 + path_rows as u16).min(22);
     let popup = centered(area, w, wanted_h);
 
-    // Clear 清掉这块区域的字符和样式，底层界面的残影不会从框里透出来
+    // Clear wipes both the glyphs and the styles in this area, so no residue
+    // from the screen below shows through the box
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -317,7 +357,7 @@ fn render_dialog(f: &mut Frame, dialog: &Dialog) {
         .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(Color::Indexed(235)))
         .title(Span::styled(
-            " 删除确认 ",
+            format!(" {} ", lang.t("dialog.title")),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
 
@@ -330,13 +370,13 @@ fn render_dialog(f: &mut Frame, dialog: &Dialog) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // 危险提示
-            Constraint::Length(1), // 问句
-            Constraint::Length(1), // 空行
-            Constraint::Length(1), // 目标标签
-            Constraint::Min(1),    // 目标路径，完整显示、换行
-            Constraint::Length(1), // 空行
-            Constraint::Length(1), // 按键提示
+            Constraint::Length(1), // danger notice
+            Constraint::Length(1), // question
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // target label
+            Constraint::Min(1),    // target path, shown in full, wrapped
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // key hints
         ])
         .split(inner);
 
@@ -361,13 +401,14 @@ fn render_dialog(f: &mut Frame, dialog: &Dialog) {
 
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            "目标",
+            lang.t("dialog.target"),
             Style::default().fg(Color::Cyan),
         )])),
         rows[3],
     );
 
-    // 完整路径：宁可换行也不省略，省略了就可能删错文件
+    // Full path: wrap rather than elide, because an elided path could point the
+    // user at the wrong file
     f.render_widget(
         Paragraph::new(target)
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
@@ -375,25 +416,30 @@ fn render_dialog(f: &mut Frame, dialog: &Dialog) {
         rows[4],
     );
 
+    let key = |key: &str| format!(" {} ", lang.t(key));
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " Enter ",
+                key("dialog.key_enter"),
                 Style::default().fg(Color::White).bg(Color::Red),
             ),
-            Span::styled(" 确认删除 ", Style::default().fg(Color::Red)),
+            Span::styled(key("dialog.action_delete"), Style::default().fg(Color::Red)),
             Span::styled(
-                "  Esc ",
+                key("dialog.key_esc"),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
-            Span::styled(" 取消 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                key("dialog.action_cancel"),
+                Style::default().fg(Color::DarkGray),
+            ),
         ])),
         rows[6],
     );
 }
 
-/// 单个字符占用的显示列数：控制字符 0 列，ASCII / 半角 1 列，
-/// CJK 与 emoji 2 列。属于常规近似，不追求完整 UAX#11
+/// Columns a single character occupies: control characters take 0 columns,
+/// ASCII / half-width takes 1, CJK and emoji take 2. A deliberate approximation,
+/// not a full UAX#11 implementation
 fn char_width(c: char) -> usize {
     match c {
         '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => 0,
@@ -405,34 +451,35 @@ fn char_width(c: char) -> usize {
     }
 }
 
-/// East Asian Wide / Fullwidth 与常用 emoji 区段
+/// East Asian Wide / Fullwidth ranges plus the common emoji ranges
 fn is_wide(cp: u32) -> bool {
     matches!(cp,
         0x1100..=0x115f      // Hangul Jamo
-        | 0x2e80..=0x303e    // CJK 部首、标点
-        | 0x3041..=0x33ff    // 假名、注音、CJK 兼容
-        | 0x3400..=0x4dbf    // CJK 扩展 A
-        | 0x4e00..=0x9fff    // CJK 统一表意
-        | 0xa000..=0xa4cf    // 彝文
-        | 0xac00..=0xd7a3    // Hangul 音节
-        | 0xf900..=0xfaff    // CJK 兼容表意
-        | 0xfe10..=0xfe19    // 竖排标点
-        | 0xfe30..=0xfe6f    // CJK 兼容形式
-        | 0xff00..=0xff60    // 全角 ASCII
-        | 0xffe0..=0xffe6    // 全角符号
-        | 0x1f300..=0x1f64f  // 杂项符号与图形、emoji 表情
-        | 0x1f680..=0x1f6ff  // 交通与地图
-        | 0x1f900..=0x1f9ff  // 补充符号与图形
-        | 0x20000..=0x3fffd  // CJK 扩展 B 及以后
+        | 0x2e80..=0x303e    // CJK radicals, punctuation
+        | 0x3041..=0x33ff    // Kana, phonetic extensions, CJK compatibility
+        | 0x3400..=0x4dbf    // CJK extension A
+        | 0x4e00..=0x9fff    // CJK unified ideographs
+        | 0xa000..=0xa4cf    // Yi
+        | 0xac00..=0xd7a3    // Hangul syllables
+        | 0xf900..=0xfaff    // CJK compatibility ideographs
+        | 0xfe10..=0xfe19    // vertical forms
+        | 0xfe30..=0xfe6f    // CJK compatibility forms
+        | 0xff00..=0xff60    // fullwidth ASCII
+        | 0xffe0..=0xffe6    // fullwidth signs
+        | 0x1f300..=0x1f64f  // misc symbols and pictographs, emoji
+        | 0x1f680..=0x1f6ff  // transport and map symbols
+        | 0x1f900..=0x1f9ff  // supplemental symbols and pictographs
+        | 0x20000..=0x3fffd  // CJK extension B and beyond
     )
 }
 
-/// 估算字符串占用的终端显示列数
+/// Estimate how many terminal columns a string takes
 pub(crate) fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
-/// 按显示宽度硬截断，保证结果不超过 `max_width` 列
+/// Hard-truncate to a display width, guaranteeing the result never exceeds
+/// `max_width` columns
 fn truncate_to_width(s: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
@@ -447,12 +494,13 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     out
 }
 
-/// 路径的根部分：盘符加分隔符；没有盘符时取到第一个分隔符之前的部分
+/// The root part of a path: a drive letter plus separator, or, without one,
+/// everything up to the first separator
 fn path_root(path: &Path) -> String {
     let s = path.to_string_lossy();
     let bytes = s.as_bytes();
 
-    // 盘符 + 分隔符，如 D:\
+    // Drive letter + separator, e.g. D:\
     if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         let sep = bytes[2];
         if sep == b'\\' || sep == b'/' {
@@ -460,7 +508,7 @@ fn path_root(path: &Path) -> String {
         }
     }
 
-    // 否则取到第一个分隔符（含分隔符）之前的部分
+    // Otherwise take everything through the first separator
     if let Some(i) = s.find(['\\', '/']) {
         s[..=i].to_string()
     } else {
@@ -468,15 +516,16 @@ fn path_root(path: &Path) -> String {
     }
 }
 
-/// 超宽时把路径省略成 `根 + "..." + 文件名`，核心不变式：
-/// 返回值的显示宽度在任何输入下都不超过 `max_width` 列
+/// Elide an over-wide path to `root + "..." + file_name`.
+/// Core invariant: the returned display width never exceeds `max_width`,
+/// whatever the input
 pub(crate) fn elide_path(path: &Path, max_width: usize) -> String {
     let full = path.to_string_lossy().to_string();
     if display_width(&full) <= max_width {
         return full;
     }
 
-    // 文件名缺失（路径以分隔符结尾等）时直接截断原串
+    // No file name (the path ends in a separator, say): truncate the original
     let Some(file_name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
         return truncate_to_width(&full, max_width);
     };
@@ -487,17 +536,18 @@ pub(crate) fn elide_path(path: &Path, max_width: usize) -> String {
         _ => (file_name.as_str(), ""),
     };
 
-    // 逐步截短文件名，扩展名优先保住
+    // Shorten the file name step by step; the extension is preserved first
     let fixed_width = display_width(&root) + 3;
     let keep = max_width.saturating_sub(fixed_width);
     let out = if display_width(stem) <= keep {
         format!("{}...{}{}", root, stem, ext)
     } else {
-        // 只剩扩展名的位置也不够就先砍文件名
+        // Drop file name characters when even the extension no longer fits
         let stem = truncate_to_width(stem, keep.saturating_sub(display_width(ext)));
         format!("{}...{}{}", root, stem, ext)
     };
-    // 根 + "..." + 扩展名本身就超宽时，按显示宽度硬截断兜底
+    // Root + "..." + extension can itself be too wide (a long root, say), so
+    // clamp one last time
     truncate_to_width(&out, max_width)
 }
 
@@ -524,10 +574,17 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::app::{DialogAction, Dialog};
+    use crate::{
+        app::{Dialog, DialogAction},
+        i18n::Lang,
+    };
 
-    /// 渲染一帧并把字符拼成纯文本，方便断言画面内容。
-    /// 宽字符会占掉两格、第二格被重置成空格，这里跳过它才能还原原文
+    /// Every language the shipped config offers
+    const LANGS: [&str; 3] = ["zh-cn", "zh-tw", "en-us"];
+
+    /// Render one frame and stitch the glyphs into plain text for assertions.
+    /// A wide character occupies two cells and the second one is reset to a
+    /// space, so skipping it is what restores the original text
     fn render(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| ui(f, app)).unwrap();
@@ -549,8 +606,15 @@ mod tests {
         out
     }
 
-    fn with_dialog(target: &str, is_dir: bool) -> App {
-        let mut app = App::new();
+    /// Built-in copy switched to `tag`, which never touches the filesystem
+    fn lang(tag: &str) -> Lang {
+        let mut lang = Lang::builtin();
+        lang.current = tag.to_string();
+        lang
+    }
+
+    fn with_dialog_in(lang: &Lang, target: &str, is_dir: bool) -> App {
+        let mut app = App::new(lang.clone());
         app.entries.clear();
         app.dialog = Some(Dialog {
             action: DialogAction::Delete,
@@ -562,19 +626,75 @@ mod tests {
 
     #[test]
     fn key_hint_never_overflows_its_row() {
-        for width in [4usize, 10, 20, 40, 56, 70, 78, 80, 100, 120, 200] {
-            let line = key_hint_line(width);
-            let w: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
-            // 边框占掉两列，提示必须落在那一行里
-            assert!(w <= width.saturating_sub(2), "width={width} 实际={w}");
+        // English copy is where the hint is widest, so check every language
+        for tag in LANGS {
+            let lang = lang(tag);
+            for width in [4usize, 10, 20, 40, 56, 70, 78, 80, 100, 120, 200] {
+                let line = key_hint_line(&lang, width);
+                let w: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+                // The border takes two columns; the hints must fit inside the row
+                assert!(w <= width.saturating_sub(2), "{tag} width={width} actual={w}");
+            }
+            // On a wide terminal both the compression keys and `d` are present
+            let full = key_hint_line(&lang, 120);
+            let text: String = full.spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(text.contains("z:tar"), "{tag}: {text}");
+            assert!(
+                text.contains(&format!("d:{}", lang.t("key.delete"))),
+                "{tag}: {text}"
+            );
         }
-        // 宽终端下压缩键与 d 都在
-        let full = key_hint_line(120);
-        let text: String = full.spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("z:tar") && text.contains("d:删除"), "{text}");
     }
 
-    /// 取出弹窗内容区的一行：去掉两侧竖边框与空白，宽字符的第二格也算空白
+    #[test]
+    fn key_hint_falls_back_to_a_single_letter_when_tiny() {
+        let lang = lang("en-us");
+        // Budget of 3 columns still holds the padded chip, 1 column only the
+        // bare letter, and nothing at all below that
+        let text = |w: usize| {
+            key_hint_line(&lang, w)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(5), " d ");
+        assert_eq!(text(3), "d");
+        assert_eq!(text(2), "");
+        assert_eq!(text(0), "");
+    }
+
+    #[test]
+    fn status_row_shows_the_localized_prefix_and_never_overflows() {
+        for tag in LANGS {
+            let lang = lang(tag);
+            for (w, h) in [(20u16, 8u16), (40, 10), (60, 14), (80, 24), (200, 50)] {
+                let mut app = App::new(lang.clone());
+                app.last_out = Some(crate::app::OutputInfo {
+                    prefix: lang.t("compress.zst.ok"),
+                    path: PathBuf::from(r"D:\lazyarchive\lazyzip\BussinGriddyCode.zst"),
+                    size: "1.25 MB".to_string(),
+                });
+                app.status = lang.t("status.ready");
+                let screen = render(&mut app, w, h);
+                let row = screen.lines().last().unwrap_or_default();
+                assert!(
+                    display_width(row.trim_end()) <= w as usize,
+                    "{tag} {w}x{h}: {row:?}"
+                );
+                if w >= 60 {
+                    assert!(
+                        row.contains(&lang.t("status.label")),
+                        "{tag} {w}x{h}: the status prefix should survive: {row:?}"
+                    );
+                    assert!(row.contains(&lang.t("status.size_field")), "{tag} {w}x{h}: {row:?}");
+                }
+            }
+        }
+    }
+
+    /// Take one row from inside the dialog: strip the side borders and
+    /// whitespace, counting the second cell of a wide character as whitespace
     fn box_line(row: &str) -> String {
         row.split('║')
             .nth(1)
@@ -587,55 +707,68 @@ mod tests {
     #[test]
     fn dialog_names_the_kind_and_shows_the_full_path() {
         let long = r"D:\工作目录\很长的中文目录名\子目录\子目录\更深的子目录\报告.tar";
-        let screen = render(&mut with_dialog(long, true), 100, 24);
+        for tag in LANGS {
+            let lang = lang(tag);
+            let screen = render(&mut with_dialog_in(&lang, long, true), 100, 24);
 
-        assert!(screen.contains("确定要删除这个目录吗?"), "目录要用目录的说法");
-        assert!(screen.contains("Enter") && screen.contains("Esc"), "两种退路都要写在框里");
+            assert!(
+                screen.contains(&lang.t("dialog.question_dir")),
+                "{tag}: a directory must be called a directory"
+            );
+            assert!(screen.contains("Enter") && screen.contains("Esc"), "{tag}: both exits must be spelled out");
 
-        // 路径太长会被弹窗自动换行，逐行拼起来必须正好是完整路径：
-        // 少一个字符就是被截断，多一个就是省略号顶替了
-        let lines: Vec<String> = screen.lines().map(box_line).collect();
-        let start = lines
-            .iter()
-            .position(|l| l.starts_with("D:\\"))
-            .expect("弹窗里应显示目标路径");
-        let mut joined = String::new();
-        for line in &lines[start..] {
-            if line.is_empty() {
-                break; // 路径区结束
+            // A long path wraps: joining the rows must reproduce the path
+            // exactly. One character short means truncation, one too many means
+            // an ellipsis stood in for something
+            let lines: Vec<String> = screen.lines().map(box_line).collect();
+            let start = lines
+                .iter()
+                .position(|l| l.starts_with("D:\\"))
+                .expect("the dialog should show the target path");
+            let mut joined = String::new();
+            for line in &lines[start..] {
+                if line.is_empty() {
+                    break; // end of the path block
+                }
+                joined.push_str(line);
+                if joined.chars().count() >= long.chars().count() {
+                    break;
+                }
             }
-            joined.push_str(line);
-            if joined.chars().count() >= long.chars().count() {
-                break;
-            }
+            assert_eq!(joined, long, "{tag}: the path must wrap in full");
+            // An elided form must never appear: it could point at the wrong file
+            assert!(
+                !screen.contains(&elide_path(Path::new(long), 40)),
+                "{tag}: the dialog must not elide the path"
+            );
         }
-        assert_eq!(joined, long, "路径必须完整换行显示");
-        // 省略后的形态绝不能出现，省略了就可能删错文件
-        assert!(
-            !screen.contains(&elide_path(Path::new(long), 40)),
-            "弹窗不能省略路径"
-        );
     }
 
     #[test]
     fn dialog_for_a_file_asks_about_a_file() {
         let short = r"D:\a\b.txt";
-        let screen = render(&mut with_dialog(short, false), 80, 20);
-        assert!(screen.contains("确定要删除这个文件吗?"), "文件要用文件的说法");
-        assert!(screen.contains(short), "{screen}");
+        for tag in LANGS {
+            let lang = lang(tag);
+            let screen = render(&mut with_dialog_in(&lang, short, false), 80, 20);
+            assert!(
+                screen.contains(&lang.t("dialog.question_file")),
+                "{tag}: a file must be called a file"
+            );
+            assert!(screen.contains(short), "{tag}: {screen}");
+        }
     }
 
     #[test]
     fn dialog_renders_on_tiny_terminals_without_panicking() {
-        // 弹窗尺寸被终端夹住，极端尺寸只要求不崩
-        for (w, h) in [(12u16, 6u16), (20, 4), (30, 10), (200, 60)] {
-            let mut app = with_dialog(r"D:\very\long\path\to\a\file.txt", false);
-            let screen = render(&mut app, w, h);
-            assert_eq!(
-                screen.lines().count(),
-                h as usize,
-                "{w}x{h} 渲染行数不对"
-            );
+        // The dialog size is clamped to the terminal; extreme sizes only have
+        // to not crash, in any language
+        for tag in LANGS {
+            let lang = lang(tag);
+            for (w, h) in [(12u16, 6u16), (20, 4), (30, 10), (200, 60)] {
+                let mut app = with_dialog_in(&lang, r"D:\very\long\path\to\a\file.txt", false);
+                let screen = render(&mut app, w, h);
+                assert_eq!(screen.lines().count(), h as usize, "{tag} {w}x{h}: wrong row count");
+            }
         }
     }
 
@@ -645,7 +778,7 @@ mod tests {
         assert_eq!(display_width("状态"), 4);
         assert_eq!(display_width("📁"), 2);
         assert_eq!(display_width("📁 文件"), 2 + 1 + 4);
-        // 控制字符不占列
+        // Control characters take no columns
         assert_eq!(display_width("\u{1b}"), 0);
         assert_eq!(display_width("ab\u{1b}c"), 3);
     }
@@ -667,8 +800,8 @@ mod tests {
     fn extension_is_preserved_when_stem_gets_cut() {
         let p = Path::new(r"D:\a\very\deep\directory\BussinGriddyCode.zst");
         let out = elide_path(p, 20);
-        assert!(out.ends_with(".zst"), "扩展名必须保留: {}", out);
-        assert!(out.starts_with(r"D:\..."), "应保留盘符根: {}", out);
+        assert!(out.ends_with(".zst"), "the extension must survive: {out}");
+        assert!(out.starts_with(r"D:\..."), "the drive root must survive: {out}");
     }
 
     #[test]
@@ -689,7 +822,7 @@ mod tests {
                 let out = elide_path(Path::new(p), budget);
                 assert!(
                     display_width(&out) <= budget,
-                    "超宽: path={:?} budget={} out={:?} width={}",
+                    "too wide: path={:?} budget={} out={:?} width={}",
                     p,
                     budget,
                     out,
@@ -710,12 +843,13 @@ mod tests {
 
     #[test]
     fn cjk_and_emoji_paths_count_as_two_columns() {
-        // 中文文件名每个字符 2 列，预算按列算而不是按字符数
+        // A CJK file name costs two columns per character, so the budget is in
+        // columns, not in characters
         let p = Path::new(r"D:\目录\中文文件.tar.gz");
         let budget = 16;
         let out = elide_path(p, budget);
-        assert!(display_width(&out) <= budget, "out={:?}", out);
-        assert!(out.ends_with(".gz"), "扩展名必须保留: {}", out);
+        assert!(display_width(&out) <= budget, "out={out:?}");
+        assert!(out.ends_with(".gz"), "the extension must survive: {out}");
 
         let emoji = Path::new(r"D:\😀😀😀\a.zst");
         assert!(display_width(&emoji.to_string_lossy()) > emoji.to_string_lossy().chars().count());
@@ -723,7 +857,7 @@ mod tests {
 
     #[test]
     fn degenerate_paths_do_not_panic() {
-        // 以分隔符结尾 / 无文件名 / 纯根 / 空路径
+        // Trailing separator / no file name / bare root / empty path
         for p in [r"D:\", "/", "", r"\\", r"C:", r"D:\.hidden", r"D:\..", r"D:\a."] {
             for budget in [0usize, 1, 3, 7, 50] {
                 let out = elide_path(Path::new(p), budget);

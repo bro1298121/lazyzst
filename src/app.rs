@@ -5,85 +5,96 @@ use std::{
     time::{Duration, Instant},
 };
 
-// 注意：不要 `use anyhow::Result`，read_dir 里在用 `Result::ok`，
-// 一旦被 anyhow 的 Result 顶掉就编译不过
+// Do NOT `use anyhow::Result` here: `read_dir` relies on `Result::ok`, and
+// shadowing it with anyhow's Result breaks the build.
 use anyhow::Context;
 
 use crate::{
     compress::{build_command, format_spec},
+    i18n::Lang,
     ui::format_size,
 };
 
-/// 文件列表可见行数
+/// Rows visible in the file list
 pub(crate) const VISIBLE_ROWS: usize = 20;
-/// 主循环节拍：驱动进度动画并限制空转
+/// Main-loop tick: drives the progress animation and caps idle CPU use
 pub(crate) const TICK: Duration = Duration::from_millis(100);
-/// 动画步进，到 100 后回绕
+/// Animation step; wraps around once it passes 100
 pub(crate) const PROGRESS_STEP: u16 = 3;
 
-/// 正在运行的压缩任务：子进程由主线程非阻塞启动，句柄一直留在这里，
-/// 退出时可以直接 kill + wait 回收，不会留下孤儿进程
+/// A running compression job. The child process is spawned without blocking
+/// on the main thread and its handle stays here, so quitting can kill + wait
+/// on it instead of leaving an orphan behind
 pub(crate) struct JobState {
     pub(crate) format: String,
     pub(crate) target: PathBuf,
     pub(crate) started: Instant,
-    /// 动画式不确定进度（外部工具拿不到真实百分比）
+    /// Animated indeterminate progress (external tools report no real percentage)
     pub(crate) progress: u16,
-    /// 子进程句柄
+    /// Child process handle
     pub(crate) child: Child,
-    /// 产物路径，用于生成完成文案
+    /// Output path, used to build the completion message
     pub(crate) out: PathBuf,
 }
 
-/// 最近一次成功产物的信息；供 UI 在窄终端下省略路径显示
+/// Info about the most recent successful output; lets the UI elide the path
+/// when the terminal is too narrow
 pub(crate) struct OutputInfo {
-    pub(crate) prefix: &'static str,
+    pub(crate) prefix: String,
     pub(crate) path: PathBuf,
     pub(crate) size: String,
 }
 
-/// 弹窗要执行的动作。目前只有不可逆的删除，
-/// 以后要加别的弹窗时在这里补一个变体，App 侧的流程不用改
+/// What a dialog does. Deletion is the only action so far; add a variant here
+/// and the App-side flow stays as it is
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DialogAction {
-    /// 永久删除文件或目录，无法撤销
+    /// Permanent, irreversible deletion of a file or directory
     Delete,
 }
 
-/// 模态弹窗状态。为 `None` 时按键走主界面逻辑；
-/// 为 `Some` 时焦点在弹窗上，只有 Enter / Esc 会被放行，其余按键全部吞掉
+/// Modal dialog state. While it is `None`, keys drive the main view; while it
+/// is `Some`, focus belongs to the dialog and only Enter / Esc get through
 pub(crate) struct Dialog {
     pub(crate) action: DialogAction,
-    /// 打开弹窗那一刻锁定的目标。界面显示和实际删除都用它，
-    /// 保证"看到的"和"删掉的"永远是同一条路径
+    /// Target locked in at open time. Both the on-screen copy and the actual
+    /// deletion use it, so what the user sees is always what gets deleted
     pub(crate) target: PathBuf,
-    /// 打开弹窗时目标的类型，决定文案与删除方式
+    /// Kind of the target when the dialog opened; drives both the wording and
+    /// how the removal is performed
     pub(crate) is_dir: bool,
 }
 
 pub(crate) struct App {
+    /// Active language table. Owned by App rather than a global so tests can
+    /// swap in `Lang::builtin()` without touching a shared singleton
+    pub(crate) lang: Lang,
     pub(crate) current_dir: PathBuf,
     pub(crate) entries: Vec<PathBuf>,
     pub(crate) selected: usize,
     pub(crate) scroll_offset: usize,
     pub(crate) status: String,
     pub(crate) job: Option<JobState>,
-    /// 有值时状态栏显示"压缩产物 + 大小"，并按终端宽度自适应省略路径
+    /// When set, the status bar shows "output + size" and elides the path to
+    /// the terminal width
     pub(crate) last_out: Option<OutputInfo>,
-    /// 模态弹窗；打开时按键被限制在 Enter / Esc
+    /// Modal dialog; while open, keys are limited to Enter / Esc
     pub(crate) dialog: Option<Dialog>,
 }
 
 impl App {
-    pub(crate) fn new() -> Self {
+    /// `lang` is passed in rather than loaded here, so tests can build an App
+    /// without reading the user's config file
+    pub(crate) fn new(lang: Lang) -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let entries = Self::read_dir(&current_dir);
         Self {
+            status: lang.t("status.ready"),
+            lang,
             current_dir,
             entries,
             selected: 0,
             scroll_offset: 0,
-            status: "就绪".to_string(),
             job: None,
             last_out: None,
             dialog: None,
@@ -116,9 +127,9 @@ impl App {
             self.entries = Self::read_dir(&self.current_dir);
             self.selected = 0;
             self.scroll_offset = 0;
-            // 换了目录，之前的压缩产物不再相关
+            // Different directory: the previous output is no longer relevant
             self.last_out = None;
-            self.status = format!("进入 {}", entry.display());
+            self.status = format!("{} {}", self.lang.t("status.entered"), entry.display());
         }
     }
 
@@ -129,9 +140,9 @@ impl App {
             self.entries = Self::read_dir(&self.current_dir);
             self.selected = 0;
             self.scroll_offset = 0;
-            // 换了目录，之前的压缩产物不再相关
+            // Different directory: the previous output is no longer relevant
             self.last_out = None;
-            self.status = format!("进入 {}", parent.display());
+            self.status = format!("{} {}", self.lang.t("status.entered"), parent.display());
         }
     }
 
@@ -139,29 +150,32 @@ impl App {
         self.entries.get(self.selected).cloned()
     }
 
-    /// 按 `d`：打开删除确认弹窗。条件不满足时只提示状态，绝不开弹窗
+    /// `d`: open the delete confirmation. When the preconditions fail it only
+    /// reports a status and never opens the dialog
     pub(crate) fn request_delete(&mut self) {
-        // 正在压缩时目标文件正被子进程读取，此时删掉它等于把压缩源从源头上抽走
+        // While a compression runs, the target is being read by the child
+        // process; deleting it now would pull the source out from under it
         if self.job.is_some() {
-            self.status = "已有任务进行中".to_string();
+            self.status = self.lang.t("status.job_running");
             return;
         }
 
         let Some(path) = self.get_selected_path() else {
-            self.status = "没有选中文件".to_string();
+            self.status = self.lang.t("status.nothing_selected");
             return;
         };
 
-        // 类型在打开时就定死：文案和删除方式都按它来，避免中途判断漂移
+        // The kind is decided once, here: both the wording and the removal use
+        // it, so nothing can drift halfway through the dialog
         self.dialog = Some(Dialog {
             action: DialogAction::Delete,
             is_dir: path.is_dir(),
             target: path,
         });
-        self.status = "确认删除? Enter 删除 / Esc 取消".to_string();
+        self.status = self.lang.t("status.confirm_prompt");
     }
 
-    /// 弹窗里按 `Enter`：执行动作，无论成败都先关掉弹窗
+    /// `Enter` inside the dialog: run the action and close the dialog either way
     pub(crate) fn confirm_dialog(&mut self) {
         let Some(dialog) = self.dialog.take() else {
             return;
@@ -170,62 +184,76 @@ impl App {
         match dialog.action {
             DialogAction::Delete => {
                 let target = dialog.target;
-                // 严格按弹窗打开时锁定的类型删除，不在这里重新判断
-                match remove_path(&target, dialog.is_dir) {
+                // Delete strictly by the kind locked in when the dialog opened;
+                // do not re-derive it here
+                match remove_path(&self.lang, &target, dialog.is_dir) {
                     Ok(()) => {
-                        // 列表少了一项，重新读取并把选中项夹回合法范围
+                        // One entry is gone: re-read and pull the selection back
+                        // into range
                         self.entries = Self::read_dir(&self.current_dir);
                         self.clamp_selection();
-                        // 上一次压缩产物的信息已不相关，留着会盖掉删除结果
+                        // The previous output info is stale and would cover up
+                        // the delete result
                         self.last_out = None;
-                        let kind = if dialog.is_dir { "目录" } else { "文件" };
-                        self.status = format!("已删除{}: {}", kind, target.display());
+                        let kind = if dialog.is_dir {
+                            self.lang.t("value.dir")
+                        } else {
+                            self.lang.t("value.file")
+                        };
+                        self.status = self.lang.tf(
+                            "status.deleted",
+                            &[&kind, &target.display().to_string()],
+                        );
                     }
                     Err(e) => {
-                        // Windows 上只读 / 被占用的文件会失败，错误交给状态栏，绝不 panic
+                        // Read-only or in-use files fail on Windows: surface the
+                        // error in the status bar, never panic
                         self.last_out = None;
-                        self.status = format!("删除失败: {}", e);
+                        self.status =
+                            format!("{}: {}", self.lang.t("status.delete_failed"), e);
                     }
                 }
             }
         }
     }
 
-    /// 弹窗里按 `Esc`：只关弹窗，什么都不删
+    /// `Esc` inside the dialog: close it and delete nothing
     pub(crate) fn dismiss_dialog(&mut self) {
         if self.dialog.take().is_none() {
             return;
         }
-        // 取消也是一次明确操作，给个回执，免得看起来像按键没生效
+        // Cancelling is a deliberate action too: give it an acknowledgement so
+        // it does not look like the key press was swallowed
         self.last_out = None;
-        self.status = "已取消删除".to_string();
+        self.status = self.lang.t("status.delete_cancelled");
     }
 
     pub(crate) fn compress(&mut self, format: &str) {
-        // 同一时间只允许一个后台任务
+        // Only one background job at a time
         if self.job.is_some() {
-            self.status = "已有任务进行中".to_string();
+            self.status = self.lang.t("status.job_running");
             return;
         }
 
         let Some(path) = self.get_selected_path() else {
-            self.status = "没有选中文件".to_string();
+            self.status = self.lang.t("status.nothing_selected");
             return;
         };
 
         let (mut cmd, out) = match build_command(format, &path) {
             Ok(built) => built,
             Err(e) => {
-                self.status = format!("错误: {}", e);
+                self.status = format!("{}: {}", self.lang.t("status.error"), e);
                 return;
             }
         };
 
-        // 非阻塞启动，句柄留在主线程，退出时能回收
+        // Spawn without blocking; the handle stays on this thread so quitting
+        // can reap it
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                self.status = format!("错误: {}", e);
+                self.status = format!("{}: {}", self.lang.t("status.error"), e);
                 return;
             }
         };
@@ -238,21 +266,23 @@ impl App {
             child,
             out,
         });
-        // 上一次的产物信息作废，新任务期间状态栏显示进度条
+        // The previous output info is stale; the status bar shows the progress
+        // bar while the new job runs
         self.last_out = None;
-        self.status = format!("开始压缩: {}", format);
+        self.status = format!("{}: {}", self.lang.t("status.compress_start"), format);
     }
 
-    /// 每次节拍推进进度动画（不确定进度，循环播放）
+    /// Advance the progress animation once per tick (indeterminate, looping)
     pub(crate) fn tick_job(&mut self) {
         if let Some(job) = self.job.as_mut() {
             job.progress = (job.progress + PROGRESS_STEP) % 101;
         }
     }
 
-    /// 轮询子进程；try_wait 不阻塞，结束后刷新列表并夹紧选中项
+    /// Poll the child process; `try_wait` does not block, and the list is
+    /// refreshed with the selection clamped once the job ends
     pub(crate) fn poll_job(&mut self) {
-        // 每帧最多调用一次 try_wait
+        // At most one try_wait call per frame
         let waited = match self.job.as_mut() {
             Some(job) => job.child.try_wait(),
             None => return,
@@ -262,11 +292,12 @@ impl App {
             Ok(Some(status)) => status,
             Ok(None) => return,
             Err(e) => {
-                // 回收子进程，避免留下孤儿
+                // Reap the child so it cannot be orphaned
                 self.cancel_job();
-                // 任务出错，旧产物信息作废，否则会盖掉错误文案
+                // The job failed: drop the stale output info, otherwise it
+                // would cover up the error message
                 self.last_out = None;
-                self.status = format!("错误: {}", e);
+                self.status = format!("{}: {}", self.lang.t("status.error"), e);
                 return;
             }
         };
@@ -274,38 +305,45 @@ impl App {
         let Some(job) = self.job.take() else {
             return;
         };
-        let (_, ok_prefix, fail_msg) = format_spec(&job.format);
+        let (ok_prefix, fail_msg) = format_spec(&self.lang, &job.format);
         if status.success() {
-            // 产物可能已被外部移动或删除，取不到大小时降级为“未知”
+            // The output may have been moved or deleted meanwhile; fall back to
+            // "unknown" when its size cannot be read
             let size = fs::metadata(&job.out)
                 .map(|meta| format_size(meta.len()))
-                .unwrap_or_else(|_| "未知".to_string());
+                .unwrap_or_else(|_| self.lang.t("value.unknown"));
             self.last_out = Some(OutputInfo {
-                prefix: ok_prefix,
+                prefix: ok_prefix.clone(),
                 path: job.out.clone(),
                 size: size.clone(),
             });
-            self.status = format!("{}: {}  大小: {}", ok_prefix, job.out.display(), size);
+            self.status = self.lang.tf(
+                "status.output",
+                &[&ok_prefix, &job.out.display().to_string(), &size],
+            );
         } else {
-            // 失败时不保留旧产物信息，状态栏改显示失败文案
+            // On failure keep no output info, so the status bar shows the
+            // failure message instead
             self.last_out = None;
-            self.status = fail_msg.to_string();
+            self.status = fail_msg;
         }
-        // 目录里新增了压缩产物，重新读取并防止越界
+        // The directory gained a new output: re-read it and stay in range
         self.entries = Self::read_dir(&self.current_dir);
         self.clamp_selection();
     }
 
-    /// 终止正在运行的任务：kill 之后必须 wait 回收，否则留下僵尸
+    /// Stop the running job: `kill` must be followed by `wait`, otherwise the
+    /// process is left behind as a zombie
     pub(crate) fn cancel_job(&mut self) {
         let Some(mut job) = self.job.take() else {
             return;
         };
         let _ = job.child.kill();
         let _ = job.child.wait();
-        // 取消之后不该继续显示上一个产物，状态栏改显示取消文案
+        // After a cancel the previous output must not linger; the status bar
+        // switches to the cancel message
         self.last_out = None;
-        self.status = "已取消正在进行的压缩".to_string();
+        self.status = self.lang.t("status.compress_cancelled");
     }
 
     fn clamp_selection(&mut self) {
@@ -330,20 +368,36 @@ impl App {
     }
 }
 
-/// 按打开弹窗时锁定的类型删除。
+/// Delete by the kind that was locked in when the dialog opened.
 ///
-/// 删除不可逆，所以这里**不重新判断类型**，而是严格照 `is_dir` 执行：
-/// 若复核发现目标类型已变（例如弹窗打开期间文件被替换成目录），
-/// 直接返回错误中止 —— 宁可删不掉，也不能出现"问的是文件、删的是整棵目录树"。
+/// Deletion is irreversible, so the kind is **not re-derived** here and `is_dir`
+/// is obeyed literally. If the re-check finds that the target changed kind (a
+/// file swapped for a directory while the dialog was open, say), return an error
+/// and abort: better to fail than to delete a whole tree the user never agreed to.
 ///
-/// 复核刻意复用 `Path::is_dir()`（会跟随符号链接），与 `request_delete` 锁定时的
-/// 判据保持一致，否则指向目录的软链接会被误判成"类型已变"而永远删不掉。
-pub(crate) fn remove_path(path: &Path, is_dir: bool) -> anyhow::Result<()> {
-    // 路径已不存在时不报"类型变了"，让下面的删除去给出"找不到文件"的真实错误
+/// The re-check deliberately reuses `Path::is_dir()` (which follows symlinks) so
+/// it matches the judgement made by `request_delete`; otherwise a symlink to a
+/// directory would read as "the kind changed" and could never be deleted.
+/// `lang` is only used to word that error, which reaches the user through the
+/// status bar.
+pub(crate) fn remove_path(lang: &Lang, path: &Path, is_dir: bool) -> anyhow::Result<()> {
+    // An already-missing path is not a kind change: let the removal below report
+    // the real "no such file" error
     if path.exists() && path.is_dir() != is_dir {
-        let expect = if is_dir { "目录" } else { "文件" };
-        let actual = if path.is_dir() { "目录" } else { "文件" };
-        anyhow::bail!("目标已从{}变成{}，为避免误删已中止", expect, actual);
+        let expect = if is_dir {
+            lang.t("value.dir")
+        } else {
+            lang.t("value.file")
+        };
+        let actual = if path.is_dir() {
+            lang.t("value.dir")
+        } else {
+            lang.t("value.file")
+        };
+        anyhow::bail!(
+            "{}",
+            lang.tf("error.type_changed", &[&expect, &actual])
+        );
     }
 
     let result = if is_dir {
@@ -351,7 +405,8 @@ pub(crate) fn remove_path(path: &Path, is_dir: bool) -> anyhow::Result<()> {
     } else {
         fs::remove_file(path)
     };
-    // 带上路径，Windows 上"拒绝访问 / 文件被占用"这类错误才知道说的是谁
+    // Carry the path along: on Windows, "access denied" or "file in use" is
+    // meaningless without knowing which file it was about
     result.with_context(|| path.display().to_string())
 }
 
@@ -361,8 +416,7 @@ mod tests {
 
     use super::*;
 
-    /// 临时目录守卫：无论用例通过还是 panic，析构时都会把目录清掉，
-    /// 不在临时目录里留垃圾
+    /// Removes the scratch directory on drop, whether the test passes or panics
     struct Scratch(PathBuf);
 
     impl Drop for Scratch {
@@ -371,21 +425,22 @@ mod tests {
         }
     }
 
-    /// 每个用例一个独立临时目录：进程 id + 自增序号命名，
-    /// 并行跑不会互相干扰，重名时先清掉上一次残留
+    /// One directory per test: named with the process id plus a counter so
+    /// parallel runs cannot collide; a leftover of the same name is cleared first
     fn scratch(tag: &str) -> Scratch {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let name = format!("lazyzst-test-{}-{tag}-{n}", std::process::id());
         let dir = std::env::temp_dir().join(name);
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("创建临时目录");
+        fs::create_dir_all(&dir).expect("create scratch dir");
         Scratch(dir)
     }
 
-    /// 只让 App 的选中项指向临时目录，避免测试去动真实的列表
+    /// Point the selection at the scratch directory so the tests never touch
+    /// the real listing. `Lang::builtin()` keeps them off the filesystem
     fn app_with_target(dir: &Path, target: PathBuf) -> App {
-        let mut app = App::new();
+        let mut app = App::new(Lang::builtin());
         app.current_dir = dir.to_path_buf();
         app.entries = vec![target];
         app.selected = 0;
@@ -401,10 +456,10 @@ mod tests {
         fs::write(&file, b"hello").unwrap();
         assert!(file.is_file());
 
-        remove_path(&file, false).expect("删除文件应成功");
+        remove_path(&Lang::builtin(), &file, false).expect("removing a file should work");
 
-        assert!(!file.exists(), "文件应已被删除");
-        assert!(dir.exists(), "只删文件，父目录应保留");
+        assert!(!file.exists(), "the file should be gone");
+        assert!(dir.exists(), "only the file goes; the parent stays");
     }
 
     #[test]
@@ -417,10 +472,10 @@ mod tests {
         let leaf = dir.join("sub/deep/leaf.bin");
         assert!(leaf.is_file());
 
-        remove_path(dir, true).expect("删除目录应成功");
+        remove_path(&Lang::builtin(), dir, true).expect("removing a directory should work");
 
-        assert!(!dir.exists(), "目录应被递归删除");
-        assert!(!leaf.exists(), "子文件应一并删除");
+        assert!(!dir.exists(), "the directory tree should be gone");
+        assert!(!leaf.exists(), "nested files go with it");
     }
 
     #[test]
@@ -429,14 +484,15 @@ mod tests {
         let dir = &s.0;
         let ghost = dir.join("never-created.txt");
 
-        let err = remove_path(&ghost, false).expect_err("不存在的路径应返回 Err");
+        let err = remove_path(&Lang::builtin(), &ghost, false).expect_err("a missing path must be an Err");
 
-        // 错误信息里要带得上路径，状态栏才有得说
+        // The error has to carry the path, otherwise the status bar has nothing
+        // to report
         assert!(
             err.to_string().contains(&ghost.display().to_string()),
-            "错误信息应带上路径: {err}"
+            "the error should name the path: {err}"
         );
-        assert!(dir.exists(), "失败不应误删父目录");
+        assert!(dir.exists(), "a failure must not remove the parent");
     }
 
     #[test]
@@ -444,21 +500,25 @@ mod tests {
         let s = scratch("swap-dir");
         let dir = &s.0;
         let p = dir.join("target");
-        // 打开弹窗那一刻它是文件
+        // A file at the moment the dialog opens
         fs::write(&p, b"x").unwrap();
         assert!(!p.is_dir());
 
-        // 弹窗打开期间被换成目录，里面还塞了别的文件
+        // Swapped for a directory while the dialog is open, with a file inside
         fs::remove_file(&p).unwrap();
         fs::create_dir(&p).unwrap();
         fs::write(p.join("leaf.txt"), b"y").unwrap();
 
-        let err = remove_path(&p, false).expect_err("类型已变时必须中止");
-        assert!(err.to_string().contains("中止"), "错误应说明已中止: {err}");
-        assert!(p.exists(), "类型不符时目标本身不得被删");
+        let lang = Lang::builtin();
+        let err = remove_path(&lang, &p, false).expect_err("a changed kind must abort");
+        assert!(
+            err.to_string().contains(&lang.t("value.dir")),
+            "the error should name the actual kind: {err}"
+        );
+        assert!(p.exists(), "the target itself must survive a kind mismatch");
         assert!(
             p.join("leaf.txt").exists(),
-            "最坏情况是删掉整棵目录树，必须完好无损"
+            "the worst case here is deleting a whole tree; it must stay intact"
         );
     }
 
@@ -467,18 +527,23 @@ mod tests {
         let s = scratch("swap-file");
         let dir = &s.0;
         let p = dir.join("target");
-        // 打开弹窗那一刻它是目录
+        // A directory at the moment the dialog opens
         fs::create_dir(&p).unwrap();
         fs::write(p.join("leaf.txt"), b"y").unwrap();
         assert!(p.is_dir());
 
-        // 弹窗打开期间目录被删掉、原位置换成一个文件
+        // The directory is removed and a file takes its place while the dialog
+        // is open
         fs::remove_dir_all(&p).unwrap();
         fs::write(&p, b"z").unwrap();
 
-        let err = remove_path(&p, true).expect_err("类型已变时必须中止");
-        assert!(err.to_string().contains("中止"), "错误应说明已中止: {err}");
-        assert!(p.exists(), "类型不符时不得删除");
+        let lang = Lang::builtin();
+        let err = remove_path(&lang, &p, true).expect_err("a changed kind must abort");
+        assert!(
+            err.to_string().contains(&lang.t("value.file")),
+            "the error should name the actual kind: {err}"
+        );
+        assert!(p.exists(), "nothing may be deleted on a kind mismatch");
     }
 
     #[test]
@@ -487,15 +552,17 @@ mod tests {
         let file = s.0.join("keep.txt");
         fs::write(&file, b"x").unwrap();
         let mut app = app_with_target(&s.0, file.clone());
+        let lang = Lang::builtin();
 
         app.request_delete();
-        assert!(app.dialog.is_some(), "应弹出确认框");
+        assert!(app.dialog.is_some(), "the dialog should open");
+        assert_eq!(app.status, lang.t("status.confirm_prompt"));
 
         app.dismiss_dialog();
 
-        assert!(app.dialog.is_none(), "Esc 应关闭弹窗");
-        assert!(file.exists(), "Esc 绝不能删文件");
-        assert_eq!(app.status, "已取消删除");
+        assert!(app.dialog.is_none(), "Esc should close the dialog");
+        assert!(file.exists(), "Esc must never delete the file");
+        assert_eq!(app.status, lang.t("status.delete_cancelled"));
     }
 
     #[test]
@@ -504,24 +571,33 @@ mod tests {
         let file = s.0.join("gone.txt");
         fs::write(&file, b"x").unwrap();
         let mut app = app_with_target(&s.0, file.clone());
+        let lang = Lang::builtin();
         app.last_out = Some(OutputInfo {
-            prefix: "已压缩",
+            prefix: lang.t("compress.zst.ok"),
             path: s.0.join("old.zst"),
             size: "1 KB".to_string(),
         });
 
         app.request_delete();
-        let dialog = app.dialog.as_ref().expect("应弹出确认框");
+        let dialog = app.dialog.as_ref().expect("the dialog should open");
         assert_eq!(dialog.action, DialogAction::Delete);
-        assert!(!dialog.is_dir, "临时文件应识别为文件");
+        assert!(!dialog.is_dir, "a scratch file should read as a file");
         assert_eq!(dialog.target, file);
 
         app.confirm_dialog();
 
-        assert!(app.dialog.is_none(), "确认后弹窗应关闭");
-        assert!(!file.exists(), "确认后文件应被删除");
-        assert!(app.last_out.is_none(), "旧产物信息必须清空，否则盖掉结果");
-        assert!(app.status.contains("已删除文件"), "status={}", app.status);
+        assert!(app.dialog.is_none(), "confirming should close the dialog");
+        assert!(!file.exists(), "the confirmed file should be deleted");
+        assert!(app.last_out.is_none(), "the stale output info must be cleared");
+        assert_eq!(
+            app.status,
+            lang.tf(
+                "status.deleted",
+                &[&lang.t("value.file"), &file.display().to_string()]
+            ),
+            "status={}",
+            app.status
+        );
     }
 
     #[test]
@@ -532,25 +608,42 @@ mod tests {
         let mut app = app_with_target(&s.0, child.clone());
 
         app.request_delete();
-        let dialog = app.dialog.as_ref().expect("应弹出确认框");
-        assert!(dialog.is_dir, "目录应识别为目录");
+        let dialog = app.dialog.as_ref().expect("the dialog should open");
+        assert!(dialog.is_dir, "a directory should read as a directory");
         assert_eq!(dialog.target, child);
 
         app.dismiss_dialog();
-        assert!(child.is_dir(), "取消不应影响任何目录");
+        assert!(child.is_dir(), "cancelling must leave directories alone");
     }
 
     #[test]
     fn nothing_selected_reports_status_without_opening_dialog() {
         let s = scratch("nosel");
-        let mut app = App::new();
+        let mut app = App::new(Lang::builtin());
         app.current_dir = s.0.clone();
         app.entries.clear();
         app.selected = 0;
 
         app.request_delete();
 
-        assert!(app.dialog.is_none(), "没有选中项时不该弹窗");
+        assert!(app.dialog.is_none(), "with nothing selected no dialog appears");
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn status_copy_follows_the_active_language() {
+        let s = scratch("lang");
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.entries.clear();
+
+        // Built-in copy is English by default
+        assert_eq!(app.status, "Ready");
+
+        // Switching the table changes what the status line says; the literal
+        // below is the zh-cn entry, spelled out on purpose to pin that table
+        app.lang.current = "zh-cn".to_string();
+        app.request_delete();
         assert_eq!(app.status, "没有选中文件");
     }
 }
