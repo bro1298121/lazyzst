@@ -31,6 +31,13 @@ pub(crate) struct JobState {
     pub(crate) out: PathBuf,
 }
 
+/// 最近一次成功产物的信息；供 UI 在窄终端下省略路径显示
+pub(crate) struct OutputInfo {
+    pub(crate) prefix: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) size: String,
+}
+
 pub(crate) struct App {
     pub(crate) current_dir: PathBuf,
     pub(crate) entries: Vec<PathBuf>,
@@ -38,6 +45,8 @@ pub(crate) struct App {
     pub(crate) scroll_offset: usize,
     pub(crate) status: String,
     pub(crate) job: Option<JobState>,
+    /// 有值时状态栏显示"压缩产物 + 大小"，并按终端宽度自适应省略路径
+    pub(crate) last_out: Option<OutputInfo>,
 }
 
 impl App {
@@ -51,6 +60,7 @@ impl App {
             scroll_offset: 0,
             status: "就绪".to_string(),
             job: None,
+            last_out: None,
         }
     }
 
@@ -80,6 +90,8 @@ impl App {
             self.entries = Self::read_dir(&self.current_dir);
             self.selected = 0;
             self.scroll_offset = 0;
+            // 换了目录，之前的压缩产物不再相关
+            self.last_out = None;
             self.status = format!("进入 {}", entry.display());
         }
     }
@@ -91,6 +103,8 @@ impl App {
             self.entries = Self::read_dir(&self.current_dir);
             self.selected = 0;
             self.scroll_offset = 0;
+            // 换了目录，之前的压缩产物不再相关
+            self.last_out = None;
             self.status = format!("进入 {}", parent.display());
         }
     }
@@ -136,6 +150,8 @@ impl App {
             child,
             out,
         });
+        // 上一次的产物信息作废，新任务期间状态栏显示进度条
+        self.last_out = None;
         self.status = format!("开始压缩: {}", format);
     }
 
@@ -160,6 +176,8 @@ impl App {
             Err(e) => {
                 // 回收子进程，避免留下孤儿
                 self.cancel_job();
+                // 任务出错，旧产物信息作废，否则会盖掉错误文案
+                self.last_out = None;
                 self.status = format!("错误: {}", e);
                 return;
             }
@@ -169,15 +187,22 @@ impl App {
             return;
         };
         let (_, ok_prefix, fail_msg) = format_spec(&job.format);
-        self.status = if status.success() {
+        if status.success() {
             // 产物可能已被外部移动或删除，取不到大小时降级为“未知”
             let size = fs::metadata(&job.out)
                 .map(|meta| format_size(meta.len()))
                 .unwrap_or_else(|_| "未知".to_string());
-            format!("{}: {}  大小: {}", ok_prefix, job.out.display(), size)
+            self.last_out = Some(OutputInfo {
+                prefix: ok_prefix,
+                path: job.out.clone(),
+                size: size.clone(),
+            });
+            self.status = format!("{}: {}  大小: {}", ok_prefix, job.out.display(), size);
         } else {
-            fail_msg.to_string()
-        };
+            // 失败时不保留旧产物信息，状态栏改显示失败文案
+            self.last_out = None;
+            self.status = fail_msg.to_string();
+        }
         // 目录里新增了压缩产物，重新读取并防止越界
         self.entries = Self::read_dir(&self.current_dir);
         self.clamp_selection();
@@ -190,6 +215,8 @@ impl App {
         };
         let _ = job.child.kill();
         let _ = job.child.wait();
+        // 取消之后不该继续显示上一个产物，状态栏改显示取消文案
+        self.last_out = None;
         self.status = "已取消正在进行的压缩".to_string();
     }
 
