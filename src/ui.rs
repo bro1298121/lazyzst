@@ -165,13 +165,17 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
                 .to_string_lossy()
                 .to_string();
             let secs = job.started.elapsed().as_secs().to_string();
+            // The detected format leads the label, so the user can see what the
+            // magic bytes turned out to be
+            let text = if job.kind.is_extract() {
+                lang.tf("status.extracting", &[&job.format, &name, &secs])
+            } else {
+                lang.tf("status.compressing", &[&job.format, &name, &secs])
+            };
             Gauge::default()
                 .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
                 .style(Style::default().bg(Color::DarkGray))
-                .label(Span::styled(
-                    lang.tf("status.compressing", &[&job.format, &name, &secs]),
-                    Style::default().fg(Color::White),
-                ))
+                .label(Span::styled(text, Style::default().fg(Color::White)))
                 .ratio(f64::from(job.progress) / 100.0)
         }
         None => {
@@ -189,7 +193,13 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
                     // too wide (an unusually long size string, say)
                     truncate_to_width(&format!("{}{}{}", head, path, tail), area.width as usize)
                 }
-                None => format!("{} {}", lang.t("status.label"), app.status),
+                // Plain status text, which can be an extraction message naming a
+                // long archive and a long directory: truncate on display width so
+                // it can never spill out of the row
+                None => truncate_to_width(
+                    &format!("{} {}", lang.t("status.label"), app.status),
+                    chunks[3].width as usize,
+                ),
             };
             Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
@@ -208,7 +218,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Key hint row. The compression keys and `d` always stay; the navigation
+/// Key hint row. The compression keys, `d` and `e` always stay; the navigation
 /// hints get dropped in order of importance, which keeps everything inside one
 /// row. The render order always follows the order of the table below
 fn key_hint_line(lang: &Lang, width: usize) -> Line<'static> {
@@ -233,11 +243,17 @@ fn key_hint_line(lang: &Lang, width: usize) -> Line<'static> {
         ),
         (
             0,
-            // The pipe is a layout separator between the two groups, not copy
-            vec![Span::styled(
-                format!(" | d:{} ", lang.t("key.delete")),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )],
+            // `d` and `e` act on the selection and share one group: a group is
+            // kept or dropped whole, so the extract hint can never appear
+            // without the delete hint beside it. The pipe is a layout separator
+            // between this group and the format chips, not copy
+            vec![
+                Span::styled(
+                    format!(" | d:{} ", lang.t("key.delete")),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                chip("e", "key.extract", Style::default().fg(Color::Green)),
+            ],
         ),
         (
             1,
@@ -635,7 +651,7 @@ mod tests {
                 // The border takes two columns; the hints must fit inside the row
                 assert!(w <= width.saturating_sub(2), "{tag} width={width} actual={w}");
             }
-            // On a wide terminal both the compression keys and `d` are present
+            // On a wide terminal the compression keys, `d` and `e` are present
             let full = key_hint_line(&lang, 120);
             let text: String = full.spans.iter().map(|s| s.content.to_string()).collect();
             assert!(text.contains("z:tar"), "{tag}: {text}");
@@ -643,6 +659,29 @@ mod tests {
                 text.contains(&format!("d:{}", lang.t("key.delete"))),
                 "{tag}: {text}"
             );
+            assert!(
+                text.contains(&format!("e:{}", lang.t("key.extract"))),
+                "{tag}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extract_key_is_never_shown_without_the_delete_key() {
+        // Both act on the selection and sit in the same tier, so `d` claims the
+        // space first and `e` is never left on its own
+        for tag in LANGS {
+            let lang = lang(tag);
+            for width in 4usize..=140 {
+                let text: String = key_hint_line(&lang, width)
+                    .spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect();
+                let has_d = text.contains(&format!("d:{}", lang.t("key.delete")));
+                let has_e = text.contains(&format!("e:{}", lang.t("key.extract")));
+                assert!(!has_e || has_d, "{tag} width={width}: {text}");
+            }
         }
     }
 

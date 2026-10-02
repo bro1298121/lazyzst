@@ -1,5 +1,6 @@
 mod app;
 mod compress;
+mod extract;
 mod i18n;
 mod ui;
 
@@ -105,6 +106,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     KeyCode::Char('n') => app.compress("gz"),
                     KeyCode::Char('m') => app.compress("xz"),
                     KeyCode::Char('d') => app.request_delete(),
+                    KeyCode::Char('e') => app.extract(),
                     KeyCode::Char('h') => {
                         app.selected = 0;
                         app.scroll_offset = 0;

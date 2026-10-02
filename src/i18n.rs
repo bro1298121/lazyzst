@@ -61,6 +61,33 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
         "語言設定讀取失敗，已回退到內建 {0}: {1}",
         "Could not read the language config, falling back to built-in {0}: {1}",
     ),
+    // ---- extraction ----
+    ("status.extract_unknown", "无法识别的格式", "無法識別的格式", "Unrecognized format"),
+    (
+        "status.nothing_extracted",
+        "文件名没有可去掉的压缩扩展名，已中止",
+        "檔名沒有可去掉的壓縮副檔名，已中止",
+        "The name has no compression extension to strip; aborted",
+    ),
+    ("status.extract_start", "开始解压: {0}（{1}）", "開始解壓: {0}（{1}）", "Extracting: {0} ({1})"),
+    (
+        "status.extracting",
+        "解压中: {0} {1} (已用 {2}s)",
+        "解壓中: {0} {1} (已用 {2}s)",
+        "Extracting: {0} {1} ({2}s)",
+    ),
+    (
+        "status.extracted",
+        "解压完成: {0} → {1}（{2} 项）",
+        "解壓完成: {0} → {1}（{2} 項）",
+        "Extracted: {0} → {1} ({2} entries)",
+    ),
+    (
+        "status.extract_cancelled",
+        "已取消正在进行的解压",
+        "已取消正在進行的解壓",
+        "Extraction cancelled",
+    ),
     // ---- shared values ----
     ("value.dir", "目录", "目錄", "Directory"),
     ("value.file", "文件", "檔案", "File"),
@@ -80,6 +107,7 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("key.enter", "进入", "進入", "Open"),
     ("key.quit", "退出", "離開", "Quit"),
     ("key.back", "返回", "返回", "Up"),
+    ("key.extract", "解压", "解壓", "Extract"),
     // ---- delete confirmation dialog ----
     ("dialog.title", "删除确认", "刪除確認", "Confirm Delete"),
     (
@@ -108,6 +136,18 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
         "目標已從{0}變成{1}，為避免誤刪已中止",
         "Target changed from {0} to {1}; aborted to avoid deleting the wrong thing",
     ),
+    (
+        "error.read_failed",
+        "无法读取文件头: {0}（{1}）",
+        "無法讀取檔頭: {0}（{1}）",
+        "Could not read the header: {0} ({1})",
+    ),
+    (
+        "error.read_too_short",
+        "文件太短，不可能是压缩包: {0}",
+        "檔案太短，不可能是壓縮檔: {0}",
+        "Too short to be an archive: {0}",
+    ),
     // ---- compression formats ----
     ("compress.tar.ok", "已打包", "已打包", "Packed"),
     ("compress.tar.fail", "tar 打包失败", "tar 打包失敗", "tar failed"),
@@ -123,6 +163,32 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("compress.gz.fail", "gz 压缩失败", "gz 壓縮失敗", "gz failed"),
     ("compress.xz.ok", "已压缩", "已壓縮", "Compressed"),
     ("compress.xz.fail", "xz 压缩失败", "xz 壓縮失敗", "xz failed"),
+    // ---- extraction, one failure key per detected format ----
+    ("extract.ok", "已解压", "已解壓", "Extracted"),
+    ("extract.fail.gz", "gzip 解压失败", "gzip 解壓失敗", "gzip failed"),
+    ("extract.fail.xz", "xz 解压失败", "xz 解壓失敗", "xz failed"),
+    ("extract.fail.zst", "zstd 解压失败", "zstd 解壓失敗", "zstd failed"),
+    ("extract.fail.bz2", "bzip2 解压失败", "bzip2 解壓失敗", "bzip2 failed"),
+    ("extract.fail.tar.gz", "tar.gz 解压失败", "tar.gz 解壓失敗", "tar.gz failed"),
+    ("extract.fail.tar.xz", "tar.xz 解压失败", "tar.xz 解壓失敗", "tar.xz failed"),
+    ("extract.fail.tar.zst", "tar.zst 解压失败", "tar.zst 解壓失敗", "tar.zst failed"),
+    ("extract.fail.tar.bz2", "tar.bz2 解压失败", "tar.bz2 解壓失敗", "tar.bz2 failed"),
+    ("extract.fail.tar", "tar 解压失败", "tar 解壓失敗", "tar failed"),
+    ("extract.fail.zip", "zip 解压失败", "zip 解壓失敗", "zip failed"),
+    ("extract.fail.7z", "7z 解压失败", "7z 解壓失敗", "7z failed"),
+    (
+        "extract.fail.rar",
+        "rar 解压失败（7z 无法处理 RAR5 归档）",
+        "rar 解壓失敗（7z 無法處理 RAR5 封存檔）",
+        "rar failed (7z cannot read RAR5 archives)",
+    ),
+    ("extract.fail.cab", "cab 解压失败", "cab 解壓失敗", "cab failed"),
+    (
+        "extract.fail.wim",
+        "wim 解压失败（需要管理员权限）",
+        "wim 解壓失敗（需要管理員權限）",
+        "wim failed (needs administrator rights)",
+    ),
 ];
 
 /// Parsed `language.json`

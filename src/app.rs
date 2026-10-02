@@ -11,6 +11,7 @@ use anyhow::Context;
 
 use crate::{
     compress::{build_command, format_spec},
+    extract::{build_extract_command, detect_format, extract_target, probe_nested, Format},
     i18n::Lang,
     ui::format_size,
 };
@@ -22,10 +23,34 @@ pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// Animation step; wraps around once it passes 100
 pub(crate) const PROGRESS_STEP: u16 = 3;
 
+/// What a running job is doing, so the completion copy and the Gauge label can
+/// branch without the compression path having to know about extraction.
+///
+/// The detected format travels with the extraction case: it decides both the
+/// wording and whether the result is a single payload or a whole directory
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JobKind {
+    /// Compressing into a new archive, named by the keymap
+    Compress,
+    /// Unpacking a detected archive into the directory being browsed
+    Extract(Format),
+}
+
+impl JobKind {
+    /// Whether the job is an extraction at all
+    pub(crate) fn is_extract(self) -> bool {
+        matches!(self, JobKind::Extract(_))
+    }
+}
+
 /// A running compression job. The child process is spawned without blocking
 /// on the main thread and its handle stays here, so quitting can kill + wait
 /// on it instead of leaving an orphan behind
 pub(crate) struct JobState {
+    /// Compression or extraction; decides the completion copy
+    pub(crate) kind: JobKind,
+    /// Format name, taken from the keymap when compressing and from magic-byte
+    /// detection when extracting
     pub(crate) format: String,
     pub(crate) target: PathBuf,
     pub(crate) started: Instant,
@@ -35,6 +60,9 @@ pub(crate) struct JobState {
     pub(crate) child: Child,
     /// Output path, used to build the completion message
     pub(crate) out: PathBuf,
+    /// How many entries the directory held when the job started, so the
+    /// extraction copy can report how many landed there
+    pub(crate) entries_before: usize,
 }
 
 /// Info about the most recent successful output; lets the UI elide the path
@@ -259,17 +287,117 @@ impl App {
         };
 
         self.job = Some(JobState {
+            kind: JobKind::Compress,
             format: format.to_string(),
             target: path,
             started: Instant::now(),
             progress: 0,
             child,
             out,
+            entries_before: self.entries.len(),
         });
         // The previous output info is stale; the status bar shows the progress
         // bar while the new job runs
         self.last_out = None;
         self.status = format!("{}: {}", self.lang.t("status.compress_start"), format);
+    }
+
+    /// `e`: extract the selected file into the directory being browsed.
+    ///
+    /// Detection reads the leading bytes on this thread, which is a short read
+    /// and keeps the interactive part of the flow immediate
+    pub(crate) fn extract(&mut self) {
+        // Only one background job at a time
+        if self.job.is_some() {
+            self.status = self.lang.t("status.job_running");
+            return;
+        }
+
+        let Some(path) = self.get_selected_path() else {
+            self.status = self.lang.t("status.nothing_selected");
+            return;
+        };
+
+        // `detect` reports why it gave up, so there is nothing to add here
+        let Some(format) = self.detect(&path) else {
+            return;
+        };
+
+        // The detection above found a stream compressor; look inside it to see
+        // whether it holds a tar rather than a lone file. `format` is plain
+        // Copy data, so nothing here touches `self`
+        let format = probe_nested(&path, format);
+
+        let dest = self.current_dir.clone();
+        let mut cmd = match build_extract_command(&self.lang, format, &path, &dest) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.status = format!("{}: {}", self.lang.t("status.error"), e);
+                return;
+            }
+        };
+
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.status = format!("{}: {}", self.lang.t("status.error"), e);
+                return;
+            }
+        };
+
+        let out = extract_target(format, &path, &dest);
+        let name = path.display().to_string();
+        let label = format.to_string();
+        self.job = Some(JobState {
+            kind: JobKind::Extract(format),
+            format: label.clone(),
+            target: path,
+            started: Instant::now(),
+            progress: 0,
+            child,
+            out,
+            entries_before: self.entries.len(),
+        });
+        self.last_out = None;
+        // Name the detected format so the user can see what was recognized
+        self.status = self.lang.tf("status.extract_start", &[&name, &label]);
+    }
+
+    /// Identify a file, distinguishing "the header could not be read" from
+    /// "the header says this is not an archive" so the status line can say
+    /// which happened
+    fn detect(&mut self, path: &Path) -> Option<Format> {
+        // Only a regular file can carry a magic number; `is_file` also keeps
+        // `detect_format` from blocking on a pipe
+        if !path.is_file() {
+            self.status = self.lang.t("status.extract_unknown");
+            return None;
+        }
+        match detect_format(path) {
+            Some(format) => Some(format),
+            None => {
+                // `detect_format` returns None both for an unknown header and
+                // for a file it could not read. Telling them apart needs the
+                // length, which is the only part worth checking: an unreadable
+                // path would have no metadata at all
+                match fs::metadata(path) {
+                    Ok(meta) if meta.len() < 262 => {
+                        self.status = self.lang.tf(
+                            "error.read_too_short",
+                            &[&path.display().to_string()],
+                        );
+                    }
+                    Ok(_) => self.status = self.lang.t("status.extract_unknown"),
+                    Err(e) => {
+                        self.status = self.lang.tf(
+                            "error.read_failed",
+                            &[&path.display().to_string(), &e.to_string()],
+                        );
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// Advance the progress animation once per tick (indeterminate, looping)
@@ -305,29 +433,79 @@ impl App {
         let Some(job) = self.job.take() else {
             return;
         };
-        let (ok_prefix, fail_msg) = format_spec(&self.lang, &job.format);
-        if status.success() {
-            // The output may have been moved or deleted meanwhile; fall back to
-            // "unknown" when its size cannot be read
+        // An extraction reports a directory or a single payload, so it gets its
+        // own copy; everything compressed keeps the wording it has always had
+        let JobKind::Extract(format) = job.kind else {
+            let (ok_prefix, fail_msg) = format_spec(&self.lang, &job.format);
+            if status.success() {
+                // The output may have been moved or deleted meanwhile; fall back
+                // to "unknown" when its size cannot be read
+                let size = fs::metadata(&job.out)
+                    .map(|meta| format_size(meta.len()))
+                    .unwrap_or_else(|_| self.lang.t("value.unknown"));
+                self.last_out = Some(OutputInfo {
+                    prefix: ok_prefix.clone(),
+                    path: job.out.clone(),
+                    size: size.clone(),
+                });
+                self.status = self.lang.tf(
+                    "status.output",
+                    &[&ok_prefix, &job.out.display().to_string(), &size],
+                );
+            } else {
+                // On failure keep no output info, so the status bar shows the
+                // failure message instead
+                self.last_out = None;
+                self.status = fail_msg;
+            }
+            // The directory gained a new output: re-read it and stay in range
+            self.entries = Self::read_dir(&self.current_dir);
+            self.clamp_selection();
+            return;
+        };
+        self.finish_extract(&job, format, status.success());
+    }
+
+    /// Completion copy for a finished extraction, then the same list refresh
+    /// the compression path does
+    fn finish_extract(&mut self, job: &JobState, format: Format, ok: bool) {
+        if !ok {
+            // No output to point at, so the status bar carries the message and
+            // the stale compression info must not cover it
+            self.last_out = None;
+            self.status = self.lang.t(format.fail_key());
+        } else if format.is_single_file() {
+            // One payload, so the same elidable output info as compression
+            // applies and the status line reuses the shared output wording
             let size = fs::metadata(&job.out)
                 .map(|meta| format_size(meta.len()))
                 .unwrap_or_else(|_| self.lang.t("value.unknown"));
+            let prefix = self.lang.t("extract.ok");
             self.last_out = Some(OutputInfo {
-                prefix: ok_prefix.clone(),
+                prefix: prefix.clone(),
                 path: job.out.clone(),
                 size: size.clone(),
             });
             self.status = self.lang.tf(
                 "status.output",
-                &[&ok_prefix, &job.out.display().to_string(), &size],
+                &[&prefix, &job.out.display().to_string(), &size],
             );
         } else {
-            // On failure keep no output info, so the status bar shows the
-            // failure message instead
+            // An archive scatters many files, so name the archive and where it
+            // landed instead of inventing a single output
+            let added =
+                Self::read_dir(&self.current_dir).len().saturating_sub(job.entries_before);
+            let count = added.to_string();
             self.last_out = None;
-            self.status = fail_msg;
+            self.status = self.lang.tf(
+                "status.extracted",
+                &[
+                    &job.target.display().to_string(),
+                    &job.out.display().to_string(),
+                    &count,
+                ],
+            );
         }
-        // The directory gained a new output: re-read it and stay in range
         self.entries = Self::read_dir(&self.current_dir);
         self.clamp_selection();
     }
@@ -343,7 +521,11 @@ impl App {
         // After a cancel the previous output must not linger; the status bar
         // switches to the cancel message
         self.last_out = None;
-        self.status = self.lang.t("status.compress_cancelled");
+        self.status = if job.kind.is_extract() {
+            self.lang.t("status.extract_cancelled")
+        } else {
+            self.lang.t("status.compress_cancelled")
+        };
     }
 
     fn clamp_selection(&mut self) {
@@ -415,6 +597,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+    use crate::extract::Format;
 
     /// Removes the scratch directory on drop, whether the test passes or panics
     struct Scratch(PathBuf);
@@ -645,5 +828,178 @@ mod tests {
         app.lang.current = "zh-cn".to_string();
         app.request_delete();
         assert_eq!(app.status, "没有选中文件");
+    }
+
+    /// A regular file whose bytes make up a gzip header, without touching its
+    /// name: this is the fixture the extraction tests identify from
+    fn gzip_archive(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let mut bytes = vec![0u8; 300];
+        bytes[0] = 0x1F;
+        bytes[1] = 0x8B;
+        fs::write(&path, bytes).expect("write fixture");
+        path
+    }
+
+    /// Point the App at the scratch directory with one selected entry
+    fn app_selecting(dir: &Path, target: PathBuf) -> App {
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = dir.to_path_buf();
+        app.entries = vec![target];
+        app.selected = 0;
+        app.scroll_offset = 0;
+        app
+    }
+
+    #[test]
+    fn extract_reports_nothing_selected_without_starting_a_job() {
+        let s = scratch("extract-nosel");
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.entries.clear();
+
+        app.extract();
+
+        assert!(app.job.is_none(), "no job may start without a selection");
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn extract_reports_an_unrecognized_format_without_starting_a_job() {
+        let s = scratch("extract-unknown");
+        // Right length, no recognizable magic
+        let plain = s.0.join("mystery.bin");
+        fs::write(&plain, vec![0u8; 400]).unwrap();
+        let mut app = app_selecting(&s.0, plain);
+
+        app.extract();
+
+        assert!(app.job.is_none(), "an unknown header must not start a job");
+        assert_eq!(app.status, app.lang.t("status.extract_unknown"));
+    }
+
+    #[test]
+    fn extract_reports_a_file_too_short_to_carry_a_magic_number() {
+        let s = scratch("extract-short");
+        let tiny = s.0.join("tiny.bin");
+        fs::write(&tiny, b"hi").unwrap();
+        let mut app = app_selecting(&s.0, tiny);
+
+        app.extract();
+
+        assert!(app.job.is_none());
+        assert_eq!(
+            app.status,
+            app.lang
+                .tf("error.read_too_short", &[&s.0.join("tiny.bin").display().to_string()])
+        );
+    }
+
+    #[test]
+    fn extract_refuses_a_directory() {
+        let s = scratch("extract-dir");
+        let mut app = app_selecting(&s.0, s.0.clone());
+
+        app.extract();
+
+        assert!(app.job.is_none(), "a directory holds no magic number");
+        assert_eq!(app.status, app.lang.t("status.extract_unknown"));
+    }
+
+    #[test]
+    fn extract_refuses_a_single_file_archive_with_nothing_to_strip() {
+        let s = scratch("extract-nosuffix");
+        // Real gzip bytes, but the name has no extension to remove
+        let path = gzip_archive(&s.0, "payload");
+        let mut app = app_selecting(&s.0, path);
+
+        app.extract();
+
+        assert!(app.job.is_none(), "must not overwrite the archive itself");
+        // The refusal is surfaced as an error with the localized reason in it
+        let reason = app.lang.t("status.nothing_extracted");
+        assert!(
+            app.status.starts_with(&format!("{}: ", app.lang.t("status.error"))),
+            "unexpected status: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(&reason),
+            "the status should explain why: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn extract_starts_a_job_for_a_recognized_archive() {
+        let s = scratch("extract-start");
+        // A gzip header under a name that agrees with it; the nested probe
+        // finds no tar inside, so this is a single-file job
+        let path = gzip_archive(&s.0, "archive.gz");
+        let mut app = app_selecting(&s.0, path.clone());
+
+        app.extract();
+
+        let job = app.job.as_ref().expect("a job should be running");
+        assert_eq!(job.kind, JobKind::Extract(Format::Gz));
+        // The name the user sees is the detected format, not the extension
+        assert_eq!(job.format, "gzip");
+        assert_eq!(job.target, path);
+        // Single-file extraction produces the payload beside the archive
+        assert_eq!(job.out, s.0.join("archive"));
+        assert_eq!(
+            app.status,
+            app.lang
+                .tf("status.extract_start", &[&path.display().to_string(), "gzip"])
+        );
+    }
+
+    #[test]
+    fn extract_targets_the_browsed_directory_for_an_archive() {
+        let s = scratch("extract-dest");
+        // A tar header at offset 257, with the archive itself in the scratch dir
+        let mut bytes = vec![0u8; 300];
+        bytes[257..262].copy_from_slice(b"ustar");
+        let path = s.0.join("bundle.dat");
+        fs::write(&path, bytes).unwrap();
+        let mut app = app_selecting(&s.0, path);
+
+        app.extract();
+
+        let job = app.job.as_ref().expect("a job should be running");
+        assert_eq!(job.kind, JobKind::Extract(Format::Tar));
+        assert_eq!(job.format, "tar");
+        // Nothing is written beside the archive: an archive fills the directory
+        // being browsed
+        assert_eq!(job.out, s.0);
+    }
+
+    #[test]
+    fn a_second_job_is_refused_while_one_is_running() {
+        let s = scratch("extract-busy");
+        let path = gzip_archive(&s.0, "archive.gz");
+        let mut app = app_selecting(&s.0, path);
+
+        app.extract();
+        assert!(app.job.is_some(), "the first job should be running");
+
+        app.extract();
+
+        assert_eq!(app.status, app.lang.t("status.job_running"));
+    }
+
+    #[test]
+    fn cancelling_an_extraction_reports_the_extraction_copy() {
+        let s = scratch("extract-cancel");
+        let path = gzip_archive(&s.0, "archive.gz");
+        let mut app = app_selecting(&s.0, path);
+
+        app.extract();
+        assert!(app.job.is_some(), "the job should be running");
+
+        app.cancel_job();
+
+        assert!(app.job.is_none());
+        assert_eq!(app.status, app.lang.t("status.extract_cancelled"));
     }
 }

@@ -22,6 +22,35 @@ pub(crate) fn output_ext(format: &str) -> &'static str {
     }
 }
 
+/// Whether the format is a single-file stream compressor
+///
+/// These wrap exactly one file, so the original name has to survive into the
+/// output for the round trip to give it back
+fn is_stream(format: &str) -> bool {
+    matches!(format, "gz" | "xz" | "zst")
+}
+
+/// Where a format's output lands next to its input.
+///
+/// Stream formats **append** the suffix (`notes.csv` -> `notes.csv.gz`) so that
+/// decompressing restores `notes.csv` exactly. Replacing the extension instead
+/// would swallow the real one and hand back a bare `notes`, silently renaming
+/// the user's file on the way out.
+///
+/// Archive formats keep replacing (`notes.csv` -> `notes.tar`): their contents
+/// travel inside the archive under their own names, so nothing is lost, and a
+/// single `.tar` reads better than `.csv.tar`.
+pub(crate) fn output_path(format: &str, path: &Path) -> PathBuf {
+    if is_stream(format) {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".");
+        name.push(output_ext(format));
+        path.with_file_name(name)
+    } else {
+        path.with_extension(output_ext(format))
+    }
+}
+
 /// Success prefix and failure message for a format, localized through `lang`.
 ///
 /// Still a pure lookup: no filesystem, no process, no state. `lang.t` never
@@ -45,7 +74,7 @@ pub(crate) fn format_spec(lang: &Lang, format: &str) -> (String, String) {
 /// gz / xz create the output file up front, so a failure to create it is
 /// reported right away instead of turning into a child process that runs and fails
 pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathBuf)> {
-    let out = path.with_extension(output_ext(format));
+    let out = output_path(format, path);
 
     let mut cmd = match format {
         "tar" => {
@@ -144,5 +173,31 @@ mod tests {
         let lang = Lang::builtin();
         let (_, fail) = format_spec(&lang, "wim");
         assert!(fail.contains("administrator"), "{fail}");
+    }
+
+    #[test]
+    fn stream_formats_append_their_suffix_while_archives_replace_it() {
+        let src = Path::new(r"D:\work\report.csv");
+        // Stream formats wrap exactly one file, so the suffix is appended.
+        // Replacing here is what used to break the round trip: `report.csv`
+        // became `report.gz`, which came back as a bare `report`
+        assert_eq!(output_path("gz", src), Path::new(r"D:\work\report.csv.gz"));
+        assert_eq!(output_path("xz", src), Path::new(r"D:\work\report.csv.xz"));
+        assert_eq!(output_path("zst", src), Path::new(r"D:\work\report.csv.zst"));
+        // Archives carry their contents under their own names, so nothing is
+        // lost by replacing, and a single `.tar` reads better than `.csv.tar`
+        assert_eq!(output_path("tar", src), Path::new(r"D:\work\report.tar"));
+        assert_eq!(output_path("zip", src), Path::new(r"D:\work\report.zip"));
+    }
+
+    #[test]
+    fn appending_works_for_names_without_an_extension() {
+        // `with_extension` would have left these untouched and produced a name
+        // identical to the input
+        assert_eq!(output_path("gz", Path::new(r"D:\work\README")), Path::new(r"D:\work\README.gz"));
+        assert_eq!(
+            output_path("zst", Path::new(r"D:\work\.gitignore")),
+            Path::new(r"D:\work\.gitignore.zst")
+        );
     }
 }
