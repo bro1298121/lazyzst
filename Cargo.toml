@@ -1,0 +1,13 @@
+[package]
+name = "lazyzip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+zstd = "0.13"
+tar = "0.4"
+anyhow = "1"
+walkdir = "2"
+chrono = "0.4"
