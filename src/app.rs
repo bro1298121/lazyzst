@@ -170,7 +170,8 @@ impl App {
         match dialog.action {
             DialogAction::Delete => {
                 let target = dialog.target;
-                match remove_path(&target) {
+                // 严格按弹窗打开时锁定的类型删除，不在这里重新判断
+                match remove_path(&target, dialog.is_dir) {
                     Ok(()) => {
                         // 列表少了一项，重新读取并把选中项夹回合法范围
                         self.entries = Self::read_dir(&self.current_dir);
@@ -329,11 +330,23 @@ impl App {
     }
 }
 
-/// 按类型删除：目录递归删除，其余按文件删除。
-/// 删除不可逆，失败原样返回交给调用方报错，不 panic
-pub(crate) fn remove_path(path: &Path) -> anyhow::Result<()> {
-    // remove_dir_all 不跟随符号链接，指向目录的软链接只会删掉链接本身
-    let result = if path.is_dir() {
+/// 按打开弹窗时锁定的类型删除。
+///
+/// 删除不可逆，所以这里**不重新判断类型**，而是严格照 `is_dir` 执行：
+/// 若复核发现目标类型已变（例如弹窗打开期间文件被替换成目录），
+/// 直接返回错误中止 —— 宁可删不掉，也不能出现"问的是文件、删的是整棵目录树"。
+///
+/// 复核刻意复用 `Path::is_dir()`（会跟随符号链接），与 `request_delete` 锁定时的
+/// 判据保持一致，否则指向目录的软链接会被误判成"类型已变"而永远删不掉。
+pub(crate) fn remove_path(path: &Path, is_dir: bool) -> anyhow::Result<()> {
+    // 路径已不存在时不报"类型变了"，让下面的删除去给出"找不到文件"的真实错误
+    if path.exists() && path.is_dir() != is_dir {
+        let expect = if is_dir { "目录" } else { "文件" };
+        let actual = if path.is_dir() { "目录" } else { "文件" };
+        anyhow::bail!("目标已从{}变成{}，为避免误删已中止", expect, actual);
+    }
+
+    let result = if is_dir {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
@@ -388,7 +401,7 @@ mod tests {
         fs::write(&file, b"hello").unwrap();
         assert!(file.is_file());
 
-        remove_path(&file).expect("删除文件应成功");
+        remove_path(&file, false).expect("删除文件应成功");
 
         assert!(!file.exists(), "文件应已被删除");
         assert!(dir.exists(), "只删文件，父目录应保留");
@@ -404,7 +417,7 @@ mod tests {
         let leaf = dir.join("sub/deep/leaf.bin");
         assert!(leaf.is_file());
 
-        remove_path(dir).expect("删除目录应成功");
+        remove_path(dir, true).expect("删除目录应成功");
 
         assert!(!dir.exists(), "目录应被递归删除");
         assert!(!leaf.exists(), "子文件应一并删除");
@@ -416,7 +429,7 @@ mod tests {
         let dir = &s.0;
         let ghost = dir.join("never-created.txt");
 
-        let err = remove_path(&ghost).expect_err("不存在的路径应返回 Err");
+        let err = remove_path(&ghost, false).expect_err("不存在的路径应返回 Err");
 
         // 错误信息里要带得上路径，状态栏才有得说
         assert!(
@@ -424,6 +437,48 @@ mod tests {
             "错误信息应带上路径: {err}"
         );
         assert!(dir.exists(), "失败不应误删父目录");
+    }
+
+    #[test]
+    fn file_replaced_by_a_directory_aborts_instead_of_deleting_the_tree() {
+        let s = scratch("swap-dir");
+        let dir = &s.0;
+        let p = dir.join("target");
+        // 打开弹窗那一刻它是文件
+        fs::write(&p, b"x").unwrap();
+        assert!(!p.is_dir());
+
+        // 弹窗打开期间被换成目录，里面还塞了别的文件
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("leaf.txt"), b"y").unwrap();
+
+        let err = remove_path(&p, false).expect_err("类型已变时必须中止");
+        assert!(err.to_string().contains("中止"), "错误应说明已中止: {err}");
+        assert!(p.exists(), "类型不符时目标本身不得被删");
+        assert!(
+            p.join("leaf.txt").exists(),
+            "最坏情况是删掉整棵目录树，必须完好无损"
+        );
+    }
+
+    #[test]
+    fn directory_replaced_by_a_file_aborts() {
+        let s = scratch("swap-file");
+        let dir = &s.0;
+        let p = dir.join("target");
+        // 打开弹窗那一刻它是目录
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("leaf.txt"), b"y").unwrap();
+        assert!(p.is_dir());
+
+        // 弹窗打开期间目录被删掉、原位置换成一个文件
+        fs::remove_dir_all(&p).unwrap();
+        fs::write(&p, b"z").unwrap();
+
+        let err = remove_path(&p, true).expect_err("类型已变时必须中止");
+        assert!(err.to_string().contains("中止"), "错误应说明已中止: {err}");
+        assert!(p.exists(), "类型不符时不得删除");
     }
 
     #[test]
