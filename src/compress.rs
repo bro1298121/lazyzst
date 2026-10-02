@@ -43,6 +43,12 @@ fn is_stream(format: &str) -> bool {
 pub(crate) fn output_path(format: &str, path: &Path) -> PathBuf {
     if is_stream(format) {
         let mut name = path.file_name().unwrap_or_default().to_os_string();
+        // A directory cannot be streamed, so it is tarred first and the stream
+        // wraps that tar. The name has to say so, or unpacking could not tell a
+        // bare `.gz` of one file from a `.tar.gz` of a tree
+        if path.is_dir() {
+            name.push(".tar");
+        }
         name.push(".");
         name.push(output_ext(format));
         path.with_file_name(name)
@@ -76,61 +82,100 @@ pub(crate) fn format_spec(lang: &Lang, format: &str) -> (String, String) {
 pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathBuf)> {
     let out = output_path(format, path);
 
-    let mut cmd = match format {
-        "tar" => {
-            let mut c = Command::new("tar");
-            c.arg("-cf").arg(&out).arg(path);
-            c
+    // None of gzip / xz / zstd accepts a directory: they answer
+    // "is a directory -- ignored" and exit non-zero without writing anything,
+    // which is what made packing a folder with n / m / b silently fail. A tree
+    // has to be tarred first, and `tar -c<flag>f` does the tar and the
+    // compression in one child process, so the job stays a single command and
+    // leaves no intermediate `.tar` to clean up afterwards
+    let dir_stream = is_stream(format) && path.is_dir();
+
+    // tar takes its member names from the path it is handed. Given an absolute
+    // one it drops the drive letter ("Removing leading drive letter from member
+    // names") and records the members as `/Users/name/...`, so unpacking
+    // rebuilds that entire chain from the drive root down. Running from the
+    // parent and naming only the entry keeps the members relative, which is
+    // what makes the archive portable. The output path stays absolute, so it is
+    // unaffected by the working directory.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let member = path.file_name().unwrap_or_default();
+
+    let mut cmd = if dir_stream {
+        let mut c = Command::new("tar");
+        match format {
+            "xz" => {
+                c.arg("-cJf");
+            }
+            "zst" => {
+                // bsdtar spells this one out instead of folding it into a
+                // single-letter flag like -z or -J
+                c.arg("--zstd").arg("-cf");
+            }
+            _ => {
+                c.arg("-czf");
+            }
         }
-        "zip" => {
-            let mut c = Command::new("powershell");
-            c.args([
-                "-Command",
-                &format!(
-                    "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-                    path.display(),
-                    out.display()
-                ),
-            ]);
-            c
+        c.current_dir(parent).arg(&out).arg(member);
+        c
+    } else {
+        match format {
+            "tar" => {
+                let mut c = Command::new("tar");
+                c.current_dir(parent).arg("-cf").arg(&out).arg(member);
+                c
+            }
+            "zip" => {
+                let mut c = Command::new("powershell");
+                c.args([
+                    "-Command",
+                    &format!(
+                        "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+                        path.display(),
+                        out.display()
+                    ),
+                ]);
+                c
+            }
+            "wim" => {
+                let mut c = Command::new("dism");
+                c.args([
+                    "/Capture-Image",
+                    &format!("/ImageFile:{}", out.display()),
+                    &format!("/CaptureDir:{}", path.display()),
+                    "/Name:archive",
+                    "/Compress:max",
+                ]);
+                c
+            }
+            "7z" => {
+                let mut c = Command::new("7z");
+                c.arg("a").arg(&out).arg(path);
+                c
+            }
+            // A single file: the compressor writes the stream straight out
+            "zst" => {
+                let mut c = Command::new("zstd");
+                c.arg("-f").arg("-T0").arg("-o").arg(&out).arg(path);
+                c
+            }
+            "gz" | "xz" => {
+                let mut c = Command::new(if format == "gz" { "gzip" } else { "xz" });
+                c.arg("-k")
+                    .arg("-f")
+                    .arg("-c")
+                    .arg(path)
+                    .stdout(Stdio::from(fs::File::create(&out)?));
+                c
+            }
+            _ => unreachable!(),
         }
-        "wim" => {
-            let mut c = Command::new("dism");
-            c.args([
-                "/Capture-Image",
-                &format!("/ImageFile:{}", out.display()),
-                &format!("/CaptureDir:{}", path.display()),
-                "/Name:archive",
-                "/Compress:max",
-            ]);
-            c
-        }
-        "7z" => {
-            let mut c = Command::new("7z");
-            c.arg("a").arg(&out).arg(path);
-            c
-        }
-        "zst" => {
-            let mut c = Command::new("zstd");
-            c.arg("-f").arg("-T0").arg("-o").arg(&out).arg(path);
-            c
-        }
-        "gz" | "xz" => {
-            let mut c = Command::new(if format == "gz" { "gzip" } else { "xz" });
-            c.arg("-k")
-                .arg("-f")
-                .arg("-c")
-                .arg(path)
-                .stdout(Stdio::from(fs::File::create(&out)?));
-            c
-        }
-        _ => unreachable!(),
     };
 
-    // gz / xz already redirect stdout into the output file; every other format
-    // discards its output: otherwise the progress chatter from 7z / zstd / dism
-    // lands straight in the TUI and shreds the screen and the progress bar
-    if !matches!(format, "gz" | "xz") {
+    // Only the single-file gz / xz branch already sent stdout into the output
+    // file. Everything else discards its output, otherwise the progress chatter
+    // from tar / 7z / zstd / dism lands in the TUI and shreds the screen and
+    // the progress bar
+    if !(matches!(format, "gz" | "xz") && !dir_stream) {
         cmd.stdout(Stdio::null());
     }
     cmd.stderr(Stdio::null());
@@ -143,6 +188,30 @@ mod tests {
     use super::*;
 
     const FORMATS: [&str; 7] = ["tar", "zip", "wim", "7z", "zst", "gz", "xz"];
+
+    /// A temporary directory that removes itself on drop, whether the test
+    /// passes or panics. Named off the process id so parallel runs cannot
+    /// collide
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lazyzst-compress-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        Scratch(dir)
+    }
 
     #[test]
     fn every_format_has_copy_in_every_language() {
@@ -166,6 +235,88 @@ mod tests {
         let lang = Lang::builtin();
         assert_eq!(format_spec(&lang, "tar").0, "Packed");
         assert_eq!(format_spec(&lang, "zst").0, "Compressed");
+    }
+
+    #[test]
+    fn a_directory_packed_as_a_stream_goes_through_tar() {
+        // gzip / xz / zstd answer "is a directory -- ignored" and exit non-zero
+        // without writing anything, so a folder has to be tarred first. This
+        // runs the real tool over a real folder, because the point is the
+        // behaviour of tar, not just the shape of the argument list
+        let dir = scratch("stream-dir");
+        fs::create_dir_all(dir.0.join("tree/inner")).unwrap();
+        fs::write(dir.0.join("tree/inner/leaf.txt"), b"payload").unwrap();
+
+        for (format, ext) in [("gz", "gz"), ("xz", "xz"), ("zst", "zst")] {
+            let target = dir.0.join("tree");
+            let (mut cmd, out) = build_command(format, &target).expect("build");
+
+            assert_eq!(cmd.get_program(), "tar", "{format}");
+            assert_eq!(out, dir.0.join(format!("tree.tar.{ext}")), "{format}");
+
+            let status = cmd.status().expect("run tar");
+            assert!(status.success(), "{format} failed: {status}");
+            assert!(out.is_file(), "{format} produced nothing");
+
+            // The archive has to hold the tree, not just exist
+            let listing = Command::new("tar")
+                .arg("-tf")
+                .arg(&out)
+                .output()
+                .expect("list");
+            assert!(listing.status.success(), "{format} is not a readable archive");
+            let names = String::from_utf8_lossy(&listing.stdout);
+            assert!(
+                names.contains("leaf.txt"),
+                "{format} lost the contents: {names}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_stream_keeps_both_suffixes() {
+        let dir = scratch("stream-name");
+        let tree = dir.0.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        // The `.tar` matters: without it a `.gz` of a tree is indistinguishable
+        // from a `.gz` of a single file
+        assert_eq!(output_path("zst", &tree), dir.0.join("tree.tar.zst"));
+        assert_eq!(output_path("gz", &tree), dir.0.join("tree.tar.gz"));
+        assert_eq!(output_path("xz", &tree), dir.0.join("tree.tar.xz"));
+        // A directory with a dot in its name still only appends
+        fs::create_dir_all(dir.0.join("my.project")).unwrap();
+        assert_eq!(
+            output_path("zst", &dir.0.join("my.project")),
+            dir.0.join("my.project.tar.zst")
+        );
+    }
+
+    #[test]
+    fn a_single_file_stream_is_still_handled_directly() {
+        // The folder workaround must not leak into the ordinary file path
+        let dir = scratch("stream-file");
+        let file = dir.0.join("report.csv");
+        fs::write(&file, b"a,b,c").unwrap();
+
+        assert_eq!(output_path("zst", &file), dir.0.join("report.csv.zst"));
+        let (cmd, _) = build_command("zst", &file).expect("build");
+        assert_eq!(cmd.get_program(), "zstd", "a file needs no tar");
+    }
+
+    #[test]
+    fn an_archive_format_on_a_directory_is_unchanged() {
+        // tar / zip / 7z / wim all took a directory before, so nothing about
+        // their handling may change
+        let dir = scratch("archive-dir");
+        let tree = dir.0.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+
+        assert_eq!(output_path("tar", &tree), dir.0.join("tree.tar"));
+        let (cmd, _) = build_command("tar", &tree).expect("build");
+        assert_eq!(cmd.get_program(), "tar");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"-cf".to_string()), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--zstd"), "{args:?}");
     }
 
     #[test]

@@ -301,8 +301,28 @@ pub(crate) fn build_extract_command(
         Format::Tar => ("tar", vec!["-xf".to_string(), arg]),
         Format::TarGz => ("tar", vec!["-xzf".to_string(), arg]),
         Format::TarXz => ("tar", vec!["-xJf".to_string(), arg]),
-        Format::TarZst => ("tar", vec!["--zstd".to_string(), "-f".to_string(), arg]),
-        Format::TarBz2 => ("tar", vec!["--bzip2".to_string(), "-f".to_string(), arg]),
+        // `-x` has to be spelled out on these two: `--zstd` / `--bzip2` are
+        // separate flags rather than single letters folded into `-xzf`, and
+        // without an operation flag tar refuses with "Must specify one of -c,
+        // -r, -t, -u, -x" and writes nothing at all
+        Format::TarZst => (
+            "tar",
+            vec![
+                "--zstd".to_string(),
+                "-x".to_string(),
+                "-f".to_string(),
+                arg,
+            ],
+        ),
+        Format::TarBz2 => (
+            "tar",
+            vec![
+                "--bzip2".to_string(),
+                "-x".to_string(),
+                "-f".to_string(),
+                arg,
+            ],
+        ),
         // bsdtar, the `tar` that ships with Windows, reads zip as well
         Format::Zip => ("tar", vec!["-xf".to_string(), arg]),
         // 7z handles both; `-y` answers the overwrite question for us, which
@@ -379,6 +399,7 @@ fn single_file_output(format: Format, path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -548,8 +569,8 @@ mod tests {
             (Format::Tar, "tar", &["-xf"]),
             (Format::TarGz, "tar", &["-xzf"]),
             (Format::TarXz, "tar", &["-xJf"]),
-            (Format::TarZst, "tar", &["--zstd", "-f"]),
-            (Format::TarBz2, "tar", &["--bzip2", "-f"]),
+            (Format::TarZst, "tar", &["--zstd", "-x", "-f"]),
+            (Format::TarBz2, "tar", &["--bzip2", "-x", "-f"]),
             (Format::Zip, "tar", &["-xf"]),
             (Format::SevenZip, "7z", &["x", "-y"]),
             (Format::Rar, "7z", &["x", "-y"]),
@@ -707,6 +728,104 @@ mod tests {
         assert_eq!(
             single_file_output(Format::Gz, Path::new(r"D:\work\report.csv.GZ")).as_deref(),
             Some(Path::new(r"D:\work\report.csv"))
+        );
+    }
+
+    #[test]
+    fn every_tar_invocation_names_an_operation() {
+        // `--zstd` and `--bzip2` cannot fold into `-xzf`, so without an explicit
+        // `-x` tar refuses with "Must specify one of -c, -r, -t, -u, -x" and
+        // unpacks nothing at all
+        let lang = Lang::builtin();
+        let dir = Path::new("D:\\work");
+        for format in [
+            Format::Tar,
+            Format::TarGz,
+            Format::TarXz,
+            Format::TarZst,
+            Format::TarBz2,
+        ] {
+            let path = Path::new(r"D:\work\bundle.tar");
+            let cmd = build_extract_command(&lang, format, path, dir).expect("build");
+            assert_eq!(cmd.get_program(), "tar", "{format}");
+
+            let all: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // `-xzf` / `-xJf` carry the operation inside the same flag, while
+            // the `--zstd` form has to spell `-x` out on its own
+            let names_an_operation = all.iter().any(|a| a == "-x")
+                || all.iter().any(|a| a.starts_with("-x") && a.len() > 2);
+            assert!(
+                names_an_operation,
+                "{format} would run without an operation: {all:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_survives_the_pack_and_unpack_round_trip() {
+        // The pairing that matters: packing a folder with a stream format writes
+        // a `.tar.zst`, and unpacking it has to name the same operation tar used
+        // when writing
+        let s = scratch("roundtrip");
+        let tree = s.0.join("tree");
+        fs::create_dir_all(tree.join("inner")).unwrap();
+        fs::write(tree.join("inner/leaf.txt"), b"payload").unwrap();
+
+        // `build_command` hands back a command that has not been started yet
+        let (mut pack, packed) = crate::compress::build_command("zst", &tree).expect("build pack");
+        assert_eq!(packed, s.0.join("tree.tar.zst"));
+        let packed_status = pack.status().expect("run tar");
+        assert!(packed_status.success(), "packing failed: {packed_status}");
+        assert!(packed.is_file(), "packing produced nothing");
+
+        // The name has to be recognized from its magic bytes and probed as
+        // tar-wrapped, exactly as the extractor does at run time
+        let detected = detect_format(&packed).expect("not recognized");
+        assert_eq!(probe_nested(&packed, detected), Format::TarZst);
+
+        // Members must be stored relative to the parent, not as the absolute
+        // path: tar silently drops the drive letter, and unpacking an archive
+        // holding `/Users/name/...` would rebuild that whole chain
+        let listing = Command::new("tar")
+            .arg("--zstd")
+            .arg("-tf")
+            .arg(&packed)
+            .output()
+            .expect("list members");
+        assert!(listing.status.success(), "cannot list members");
+        let members = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            members.contains("tree/inner/leaf.txt"),
+            "members are not relative: {members}"
+        );
+        assert!(
+            !members.contains(':') && !members.contains("Users"),
+            "an absolute path leaked into the archive: {members}"
+        );
+
+        let lang = Lang::builtin();
+        let mut cmd =
+            build_extract_command(&lang, Format::TarZst, &packed, &s.0).expect("build unpack");
+
+        // Unpack somewhere clean, so finding the tree there proves it worked
+        let dest = s.0.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        cmd.current_dir(&dest);
+        let status = cmd.status().expect("run tar");
+        assert!(status.success(), "unpacking failed: {status}");
+        assert_eq!(
+            fs::read_to_string(dest.join("tree/inner/leaf.txt")).unwrap(),
+            "payload",
+            "the tree did not survive the round trip"
+        );
+        // Nothing may appear above `dest`: that is where a stray absolute
+        // member would land
+        assert!(
+            !s.0.join("Users").exists(),
+            "extraction escaped the destination directory"
         );
     }
 }

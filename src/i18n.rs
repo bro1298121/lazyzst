@@ -92,6 +92,8 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("value.dir", "目录", "目錄", "Directory"),
     ("value.file", "文件", "檔案", "File"),
     ("value.unknown", "未知", "未知", "Unknown"),
+    // A directory sum that hit the walk budget is a floor, not a total
+    ("value.size_partial", "{0}+", "{0}+", "{0}+"),
     // ---- file info panel ----
     ("info.name", "名称:", "名稱:", "Name:"),
     ("info.type", "类型:", "類型:", "Type:"),

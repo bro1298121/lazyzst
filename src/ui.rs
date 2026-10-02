@@ -89,21 +89,27 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
 
     // Right: file info
     let info_text = if let Some(path) = app.get_selected_path() {
+        // Walking a directory is expensive and the redraw runs on a timer, so
+        // the measurement is kept until the selection moves elsewhere
+        let size = match &app.size_cache {
+            Some((cached, text)) if cached == &path => text.clone(),
+            _ => {
+                let text = size_of(&path, lang);
+                app.size_cache = Some((path.clone(), text.clone()));
+                text
+            }
+        };
+
         // An unreadable metadata shows as "unknown": never invent a size or time
-        let (size, modified) = match fs::metadata(&path) {
-            Ok(meta) => (
-                format_size(meta.len()),
-                meta.modified()
-                    .map(|t| {
-                        let dt: chrono::DateTime<chrono::Local> = t.into();
-                        dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                    })
-                    .unwrap_or_else(|_| lang.t("value.unknown")),
-            ),
-            Err(_) => (
-                lang.t("value.unknown"),
-                lang.t("value.unknown"),
-            ),
+        let modified = match fs::metadata(&path) {
+            Ok(meta) => meta
+                .modified()
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Local> = t.into();
+                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_else(|_| lang.t("value.unknown")),
+            Err(_) => lang.t("value.unknown"),
         };
 
         let label = |key: &str| Span::styled(format!("{} ", lang.t(key)), Style::default().fg(Color::Cyan));
@@ -567,12 +573,88 @@ pub(crate) fn elide_path(path: &Path, max_width: usize) -> String {
     truncate_to_width(&out, max_width)
 }
 
+/// How many directory entries one size measurement will visit before giving up.
+///
+/// `ui` redraws on a timer, and a tree holding millions of files would turn a
+/// size lookup into a visible stall. Stopping early leaves a lower bound, which
+/// is labelled as one rather than passed off as a true total.
+const SIZE_WALK_BUDGET: usize = 5_000;
+
+/// Sum the lengths of every file under a directory.
+///
+/// A directory handle carries no usable size of its own: on Windows its `len()`
+/// comes back as a fixed meaningless value (a folder holding 5 MB reads back as
+/// 1), so a directory can only be sized by walking it. Symlinks are not
+/// followed, which keeps a link pointing back up the tree from looping or from
+/// counting the same bytes twice.
+///
+/// Returns the total and whether the walk finished inside the budget.
+fn directory_size(path: &Path, budget: usize) -> (u64, bool) {
+    let mut total: u64 = 0;
+    let mut files = 0usize;
+
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        // A broken symlink or a vanished file is not worth failing the whole
+        // measurement over; skip it and keep what has been counted
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            // `saturating_add` because a total past u64 would otherwise wrap
+            // around to a small number, which is the very bug this replaces
+            total = total.saturating_add(meta.len());
+        }
+        files += 1;
+        if files >= budget {
+            return (total, false);
+        }
+    }
+    (total, true)
+}
+
+/// Human-readable size of `path`: its own length for a file, the summed
+/// contents for a directory.
+pub(crate) fn size_of(path: &Path, lang: &Lang) -> String {
+    size_of_budgeted(path, SIZE_WALK_BUDGET, lang)
+}
+
+/// `size_of` with an explicit walk budget. Splitting it out is what lets the
+/// tests drive the truncated path without building a tree of 50 000 files.
+fn size_of_budgeted(path: &Path, budget: usize, lang: &Lang) -> String {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let (total, complete) = directory_size(path, budget);
+            let text = format_size(total);
+            if complete {
+                text
+            } else {
+                // Say that this is a floor rather than let a partial sum read
+                // as the whole
+                lang.tf("value.size_partial", &[&text])
+            }
+        }
+        Ok(meta) => format_size(meta.len()),
+        Err(_) => lang.t("value.unknown"),
+    }
+}
+
+/// Scale a byte count into the largest unit that keeps it readable.
+///
+/// Steps up through PB as well, so a figure far past the terabytes still reads
+/// as a number with a sane exponent instead of an unwieldy digit string.
 pub(crate) fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    const PB: u64 = TB * 1024;
 
-    if bytes >= GB {
+    if bytes >= PB {
+        format!("{:.2} PB", bytes as f64 / PB as f64)
+    } else if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
         format!("{:.2} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
         format!("{:.2} MB", bytes as f64 / MB as f64)
@@ -638,6 +720,27 @@ mod tests {
             is_dir,
         });
         app
+    }
+
+    /// A temporary directory that removes itself on drop, whether the test
+    /// passes or panics. Named off the process id so parallel runs cannot
+    /// collide with each other
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str) -> Scratch {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lazyzst-uisize-{}-{tag}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        Scratch(dir)
     }
 
     #[test]
@@ -892,6 +995,91 @@ mod tests {
 
         let emoji = Path::new(r"D:\😀😀😀\a.zst");
         assert!(display_width(&emoji.to_string_lossy()) > emoji.to_string_lossy().chars().count());
+    }
+
+    #[test]
+    fn sizes_scale_through_terabytes_and_petabytes() {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        const TB: u64 = GB * 1024;
+        const PB: u64 = TB * 1024;
+
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1), "1 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(KB), "1.00 KB");
+        assert_eq!(format_size(MB), "1.00 MB");
+        assert_eq!(format_size(GB), "1.00 GB");
+        // The units the report asked for: a terabyte is a real figure again,
+        // not a wall of digits
+        assert_eq!(format_size(TB), "1.00 TB");
+        assert_eq!(format_size(1500 * TB), "1.46 PB");
+        // ... and past that it keeps stepping up instead of overflowing
+        assert_eq!(format_size(PB), "1.00 PB");
+        // The largest representable total still renders as a number with a
+        // sane exponent instead of overflowing into nonsense
+        assert!(format_size(u64::MAX).ends_with(" PB"), "{}", format_size(u64::MAX));
+    }
+
+    #[test]
+    fn a_terabyte_of_real_bytes_is_not_reported_as_zero() {
+        // A total past the terabytes must never wrap into a small number; the
+        // old fixed-unit ladder had nowhere to go past the gigabytes
+        let huge = 5_000u64 * 1024 * 1024 * 1024 * 1024;
+        let shown = format_size(huge);
+        assert!(shown.ends_with(" PB"), "{shown}");
+        // 5000 TB is 4.88 PB, and crucially still a multi-digit total rather
+        // than something that looks like an empty folder
+        assert!(shown.starts_with("4.88 PB"), "{shown}");
+    }
+
+    #[test]
+    fn a_directory_reports_the_size_of_what_it_contains() {
+        // Windows hands back a meaningless length for a directory handle, so a
+        // directory has to be walked; the file itself must not be trusted
+        let dir = scratch("size");
+        fs::create_dir_all(dir.0.join("nested")).unwrap();
+        fs::write(dir.0.join("a.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(dir.0.join("nested/b.bin"), vec![0u8; 8192]).unwrap();
+
+        let lang = Lang::builtin();
+        let shown = size_of(&dir.0, &lang);
+        // 4096 + 8192 = 12288 bytes, i.e. exactly 12.00 KB, counted across the
+        // nested directory rather than taken from the folder's own handle
+        assert_eq!(shown, "12.00 KB");
+
+        // A plain file still reports its own length
+        assert_eq!(size_of(&dir.0.join("a.bin"), &lang), "4.00 KB");
+    }
+
+    #[test]
+    fn an_empty_directory_is_zero_and_a_missing_one_is_unknown() {
+        let dir = scratch("size-empty");
+        let lang = Lang::builtin();
+        fs::create_dir_all(dir.0.join("void")).unwrap();
+
+        assert_eq!(size_of(&dir.0.join("void"), &lang), "0 B");
+        assert_eq!(size_of(&dir.0.join("nope"), &lang), lang.t("value.unknown"));
+    }
+
+    #[test]
+    fn a_walk_that_hits_its_budget_is_marked_as_a_lower_bound() {
+        let dir = scratch("size-budget");
+        fs::create_dir_all(&dir.0).unwrap();
+        for i in 0..10 {
+            fs::write(dir.0.join(format!("f{i}.bin")), vec![0u8; 16]).unwrap();
+        }
+        let lang = Lang::builtin();
+
+        // Enough budget to finish: a plain total
+        assert_eq!(directory_size(&dir.0, 100), (160, true));
+        // Budget of zero stops before the first file, and must say so rather
+        // than present an empty total as the real size
+        let (total, complete) = directory_size(&dir.0, 0);
+        assert!(!complete, "a truncated walk must not claim to be complete");
+        assert!(total <= 160);
+        assert!(size_of_budgeted(&dir.0, 0, &lang).ends_with('+'));
     }
 
     #[test]
