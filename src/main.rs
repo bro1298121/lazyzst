@@ -15,8 +15,7 @@ use ratatui::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::mpsc::{self, Receiver},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -27,13 +26,18 @@ const TICK: Duration = Duration::from_millis(100);
 /// 动画步进，到 100 后回绕
 const PROGRESS_STEP: u16 = 3;
 
-/// 后台压缩任务的状态；只保存 Send 的数据，便于主线程随时读取
+/// 正在运行的压缩任务：子进程由主线程非阻塞启动，句柄一直留在这里，
+/// 退出时可以直接 kill + wait 回收，不会留下孤儿进程
 struct JobState {
     format: String,
     target: PathBuf,
     started: Instant,
     /// 动画式不确定进度（外部工具拿不到真实百分比）
     progress: u16,
+    /// 子进程句柄
+    child: Child,
+    /// 产物路径，用于生成完成文案
+    out: PathBuf,
 }
 
 struct App {
@@ -43,7 +47,6 @@ struct App {
     scroll_offset: usize,
     status: String,
     job: Option<JobState>,
-    job_rx: Option<Receiver<Result<String>>>,
 }
 
 impl App {
@@ -57,7 +60,6 @@ impl App {
             scroll_offset: 0,
             status: "就绪".to_string(),
             job: None,
-            job_rx: None,
         }
     }
 
@@ -118,22 +120,31 @@ impl App {
             return;
         };
 
-        // 线程只捕获 PathBuf 和格式名，不借用 &self
-        let (tx, rx) = mpsc::channel::<Result<String>>();
-        let fmt = format.to_string();
-        let target = path.clone();
-        std::thread::spawn(move || {
-            let result = run_compress(&fmt, &target);
-            let _ = tx.send(result);
-        });
+        let (mut cmd, out) = match build_command(format, &path) {
+            Ok(built) => built,
+            Err(e) => {
+                self.status = format!("错误: {}", e);
+                return;
+            }
+        };
+
+        // 非阻塞启动，句柄留在主线程，退出时能回收
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.status = format!("错误: {}", e);
+                return;
+            }
+        };
 
         self.job = Some(JobState {
             format: format.to_string(),
             target: path,
             started: Instant::now(),
             progress: 0,
+            child,
+            out,
         });
-        self.job_rx = Some(rx);
         self.status = format!("开始压缩: {}", format);
     }
 
@@ -144,24 +155,47 @@ impl App {
         }
     }
 
-    /// 收取后台线程的结果；任务结束后刷新列表并夹紧选中项
+    /// 轮询子进程；try_wait 不阻塞，结束后刷新列表并夹紧选中项
     fn poll_job(&mut self) {
-        let Some(rx) = self.job_rx.as_ref() else {
-            return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
+        // 每帧最多调用一次 try_wait
+        let waited = match self.job.as_mut() {
+            Some(job) => job.child.try_wait(),
+            None => return,
         };
 
-        self.job = None;
-        self.job_rx = None;
-        self.status = match result {
-            Ok(msg) => msg,
-            Err(e) => format!("错误: {}", e),
+        let status = match waited {
+            Ok(Some(status)) => status,
+            Ok(None) => return,
+            Err(e) => {
+                // 回收子进程，避免留下孤儿
+                self.cancel_job();
+                self.status = format!("错误: {}", e);
+                return;
+            }
+        };
+
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let (_, ok_prefix, fail_msg) = format_spec(&job.format);
+        self.status = if status.success() {
+            format!("{}: {}", ok_prefix, job.out.display())
+        } else {
+            fail_msg.to_string()
         };
         // 目录里新增了压缩产物，重新读取并防止越界
         self.entries = Self::read_dir(&self.current_dir);
         self.clamp_selection();
+    }
+
+    /// 终止正在运行的任务：kill 之后必须 wait 回收，否则留下僵尸
+    fn cancel_job(&mut self) {
+        let Some(mut job) = self.job.take() else {
+            return;
+        };
+        let _ = job.child.kill();
+        let _ = job.child.wait();
+        self.status = "已取消正在进行的压缩".to_string();
     }
 
     fn clamp_selection(&mut self) {
@@ -186,131 +220,85 @@ impl App {
     }
 }
 
-/// 按格式分派到具体的压缩实现
-fn run_compress(format: &str, path: &Path) -> Result<String> {
+/// 各格式的：产物扩展名 / 成功文案前缀 / 失败文案
+fn format_spec(format: &str) -> (&'static str, &'static str, &'static str) {
     match format {
-        "tar" => compress_tar(path),
-        "zip" => compress_zip(path),
-        "wim" => compress_wim(path),
-        "7z" => compress_7z(path),
-        "zst" => compress_zst(path),
-        "gz" => compress_gz(path),
-        "xz" => compress_xz(path),
+        "tar" => ("tar", "已打包", "tar 打包失败"),
+        "zip" => ("zip", "已压缩", "zip 压缩失败"),
+        "wim" => ("wim", "已压缩", "wim 压缩失败（需要管理员权限）"),
+        "7z" => ("7z", "已压缩", "7z 压缩失败"),
+        "zst" => ("zst", "已压缩", "zst 压缩失败"),
+        "gz" => ("gz", "已压缩", "gz 压缩失败"),
+        "xz" => ("xz", "已压缩", "xz 压缩失败"),
         _ => unreachable!(),
     }
 }
 
-fn compress_tar(path: &Path) -> Result<String> {
-    let out = path.with_extension("tar");
-    let status = Command::new("tar")
-        .arg("-cf")
-        .arg(&out)
-        .arg(path)
-        .status()?;
-    if status.success() {
-        Ok(format!("已打包: {}", out.display()))
-    } else {
-        Ok("tar 打包失败".to_string())
-    }
-}
+/// 按格式拼出未启动的命令与产物路径；gz / xz 预先建好产物文件，
+/// 这样创建失败能立刻报错，而不会变成一个跑失败的子进程
+fn build_command(format: &str, path: &Path) -> Result<(Command, PathBuf)> {
+    let (ext, _, _) = format_spec(format);
+    let out = path.with_extension(ext);
 
-fn compress_zip(path: &Path) -> Result<String> {
-    let out = path.with_extension("zip");
-    let status = Command::new("powershell")
-        .args([
-            "-Command",
-            &format!(
-                "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-                path.display(),
-                out.display()
-            ),
-        ])
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("zip 压缩失败".to_string())
-    }
-}
+    let mut cmd = match format {
+        "tar" => {
+            let mut c = Command::new("tar");
+            c.arg("-cf").arg(&out).arg(path);
+            c
+        }
+        "zip" => {
+            let mut c = Command::new("powershell");
+            c.args([
+                "-Command",
+                &format!(
+                    "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    path.display(),
+                    out.display()
+                ),
+            ]);
+            c
+        }
+        "wim" => {
+            let mut c = Command::new("dism");
+            c.args([
+                "/Capture-Image",
+                &format!("/ImageFile:{}", out.display()),
+                &format!("/CaptureDir:{}", path.display()),
+                "/Name:archive",
+                "/Compress:max",
+            ]);
+            c
+        }
+        "7z" => {
+            let mut c = Command::new("7z");
+            c.arg("a").arg(&out).arg(path);
+            c
+        }
+        "zst" => {
+            let mut c = Command::new("zstd");
+            c.arg("-f").arg("-T0").arg("-o").arg(&out).arg(path);
+            c
+        }
+        "gz" | "xz" => {
+            let mut c = Command::new(if format == "gz" { "gzip" } else { "xz" });
+            c.arg("-k")
+                .arg("-f")
+                .arg("-c")
+                .arg(path)
+                .stdout(Stdio::from(fs::File::create(&out)?));
+            c
+        }
+        _ => unreachable!(),
+    };
 
-fn compress_wim(path: &Path) -> Result<String> {
-    let out = path.with_extension("wim");
-    let status = Command::new("dism")
-        .args([
-            "/Capture-Image",
-            &format!("/ImageFile:{}", out.display()),
-            &format!("/CaptureDir:{}", path.display()),
-            "/Name:archive",
-            "/Compress:max",
-        ])
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("wim 压缩失败（需要管理员权限）".to_string())
+    // gz / xz 的 stdout 已重定向到产物文件，其余格式一律丢弃输出：
+    // 否则 7z / zstd / dism 的进度输出会直接打进 TUI 画面，撕裂界面和进度条
+    if !matches!(format, "gz" | "xz") {
+        cmd.stdout(Stdio::null());
     }
-}
+    cmd.stderr(Stdio::null());
 
-fn compress_7z(path: &Path) -> Result<String> {
-    let out = path.with_extension("7z");
-    let status = Command::new("7z")
-        .arg("a")
-        .arg(&out)
-        .arg(path)
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("7z 压缩失败".to_string())
-    }
-}
-
-fn compress_zst(path: &Path) -> Result<String> {
-    let out = path.with_extension("zst");
-    let status = Command::new("zstd")
-        .arg("-f")
-        .arg("-T0")
-        .arg("-o")
-        .arg(&out)
-        .arg(path)
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("zst 压缩失败".to_string())
-    }
-}
-
-fn compress_gz(path: &Path) -> Result<String> {
-    let out = path.with_extension("gz");
-    let status = Command::new("gzip")
-        .arg("-k")
-        .arg("-f")
-        .arg("-c")
-        .arg(path)
-        .stdout(std::process::Stdio::from(fs::File::create(&out)?))
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("gz 压缩失败".to_string())
-    }
-}
-
-fn compress_xz(path: &Path) -> Result<String> {
-    let out = path.with_extension("xz");
-    let status = Command::new("xz")
-        .arg("-k")
-        .arg("-f")
-        .arg("-c")
-        .arg(path)
-        .stdout(std::process::Stdio::from(fs::File::create(&out)?))
-        .status()?;
-    if status.success() {
-        Ok(format!("已压缩: {}", out.display()))
-    } else {
-        Ok("xz 压缩失败".to_string())
-    }
+    Ok((cmd, out))
 }
 
 fn main() -> Result<()> {
@@ -331,6 +319,13 @@ fn main() -> Result<()> {
 }
 
 fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    let result = event_loop(terminal, app);
+    // 正常退出或中途出错，都要在离开 alternate screen 前回收子进程
+    app.cancel_job();
+    result
+}
+
+fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut last_tick = Instant::now();
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -388,6 +383,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             app.poll_job();
         }
     }
+
     Ok(())
 }
 
@@ -463,18 +459,19 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // 右：文件信息
     let info_text = if let Some(path) = app.get_selected_path() {
-        let meta = fs::metadata(&path).unwrap_or_else(|_| {
-            // 构造一个假的 metadata
-            fs::metadata(".").unwrap()
-        });
-        let size = format_size(meta.len());
-        let modified = meta
-            .modified()
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Local> = t.into();
-                dt.format("%Y-%m-%d %H:%M:%S").to_string()
-            })
-            .unwrap_or_else(|_| "未知".to_string());
+        // 读不到 metadata 就显示"未知"，不伪造大小和时间
+        let (size, modified) = match fs::metadata(&path) {
+            Ok(meta) => (
+                format_size(meta.len()),
+                meta.modified()
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Local> = t.into();
+                        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                    })
+                    .unwrap_or_else(|_| "未知".to_string()),
+            ),
+            Err(_) => ("未知".to_string(), "未知".to_string()),
+        };
 
         let lines = vec![
             Line::from(vec![
