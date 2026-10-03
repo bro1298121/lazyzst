@@ -2,6 +2,7 @@ mod app;
 mod compress;
 mod extract;
 mod i18n;
+mod icons;
 mod ui;
 
 use std::time::Instant;
@@ -27,6 +28,13 @@ fn main() -> Result<()> {
     // Read the language before the alternate screen goes up: a broken config
     // degrades to the built-in copy and says so in the status bar
     let (lang, notice) = Lang::load();
+    // Same reasoning for the icons: a terminal with no Nerd Font would draw
+    // empty boxes, so the switch has to be settled before the first frame and
+    // handed to the App rather than re-read while drawing
+    let use_nerd_icons = nerd_icons_enabled(
+        &std::env::args().collect::<Vec<String>>(),
+        std::env::var(NERD_ICONS_ENV).ok().as_deref(),
+    );
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -34,7 +42,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(lang);
+    let mut app = App::new(lang, use_nerd_icons);
     if let Some(notice) = notice {
         app.status = notice;
     }
@@ -45,6 +53,35 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Environment variable that turns the Nerd Font icons off
+const NERD_ICONS_ENV: &str = "LAZYZIP_NERD_ICONS";
+
+/// Command line flag that turns the Nerd Font icons off
+const NO_NERD_ICONS_FLAG: &str = "--no-nerd-icons";
+
+/// Whether the listing leads its rows with Nerd Font glyphs.
+///
+/// On unless something says otherwise, so a terminal that has the font gets the
+/// per-type glyphs and every other terminal quietly keeps the plain emoji
+/// instead of a column of empty boxes. Either switch turns them off.
+///
+/// When both are given, off wins. A variable left over in a shell profile is
+/// the one that is easy to forget about and hard to see, so it must not be able
+/// to overrule a flag somebody typed in front of them
+fn nerd_icons_enabled(args: &[String], env: Option<&str>) -> bool {
+    if args.iter().any(|arg| arg == NO_NERD_ICONS_FLAG) {
+        return false;
+    }
+    match env {
+        // An unset or empty variable says nothing, so the default stands
+        None => true,
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+    }
 }
 
 fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
@@ -136,4 +173,49 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The arguments a shell would hand over, program name included
+    fn args(extra: &[&str]) -> Vec<String> {
+        std::iter::once("lazyzst")
+            .chain(extra.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn the_icons_are_on_unless_something_says_otherwise() {
+        // Nothing at all: the glyphs are the point of the feature, so a plain
+        // run must not need a flag to get them
+        assert!(nerd_icons_enabled(&args(&[]), None));
+        assert!(nerd_icons_enabled(&args(&[]), Some("")));
+        assert!(nerd_icons_enabled(&args(&[]), Some("1")));
+        assert!(nerd_icons_enabled(&args(&[]), Some("on")));
+        // An unrelated flag must not switch them off by accident
+        assert!(nerd_icons_enabled(&args(&["--lang", "en-us"]), None));
+    }
+
+    #[test]
+    fn either_switch_turns_the_icons_off() {
+        // The flag, wherever it sits among the other arguments
+        assert!(!nerd_icons_enabled(&args(&["--no-nerd-icons"]), None));
+        assert!(!nerd_icons_enabled(&args(&["--lang", "en-us", "--no-nerd-icons"]), None));
+
+        // The environment, in every spelling a shell script is likely to write
+        for value in ["0", "off", "OFF", "False", "no", " off ", "\tfalse\n"] {
+            assert!(
+                !nerd_icons_enabled(&args(&[]), Some(value)),
+                "{value:?} should turn the icons off"
+            );
+        }
+
+        // Both switches present is still off: the flag is the one somebody typed
+        // in front of them, so it has the last word
+        assert!(!nerd_icons_enabled(&args(&["--no-nerd-icons"]), Some("0")));
+        assert!(!nerd_icons_enabled(&args(&["--no-nerd-icons"]), Some("1")));
+    }
 }

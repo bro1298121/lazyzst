@@ -160,12 +160,18 @@ pub(crate) struct App {
     /// depending on a hash. Stored as absolute paths, so a mark survives
     /// navigating away and back, and is unrelated to the listing it was made from
     pub(crate) marked: Vec<PathBuf>,
+    /// Whether the listing leads its rows with Nerd Font glyphs instead of the
+    /// plain emoji. Settled once at startup from the command line and the
+    /// environment, then held here so the render path never reads either
+    pub(crate) use_nerd_icons: bool,
 }
 
 impl App {
     /// `lang` is passed in rather than loaded here, so tests can build an App
-    /// without reading the user's config file
-    pub(crate) fn new(lang: Lang) -> Self {
+    /// without reading the user's config file. `use_nerd_icons` likewise comes
+    /// from the caller: the same reason, plus it keeps the startup argument and
+    /// environment parsing in one readable place instead of in here
+    pub(crate) fn new(lang: Lang, use_nerd_icons: bool) -> Self {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let entries = Self::read_dir(&current_dir);
         Self {
@@ -180,6 +186,7 @@ impl App {
             dialog: None,
             size_cache: None,
             marked: Vec::new(),
+            use_nerd_icons,
         }
     }
 
@@ -828,7 +835,7 @@ mod tests {
     /// Point the selection at the scratch directory so the tests never touch
     /// the real listing. `Lang::builtin()` keeps them off the filesystem
     fn app_with_target(dir: &Path, target: PathBuf) -> App {
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = dir.to_path_buf();
         app.entries = vec![target];
         app.selected = 0;
@@ -1007,7 +1014,7 @@ mod tests {
     #[test]
     fn nothing_selected_reports_status_without_opening_dialog() {
         let s = scratch("nosel");
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.entries.clear();
         app.selected = 0;
@@ -1021,7 +1028,7 @@ mod tests {
     #[test]
     fn status_copy_follows_the_active_language() {
         let s = scratch("lang");
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.entries.clear();
 
@@ -1048,7 +1055,7 @@ mod tests {
 
     /// Point the App at the scratch directory with one selected entry
     fn app_selecting(dir: &Path, target: PathBuf) -> App {
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = dir.to_path_buf();
         app.entries = vec![target];
         app.selected = 0;
@@ -1059,7 +1066,7 @@ mod tests {
     #[test]
     fn extract_reports_nothing_selected_without_starting_a_job() {
         let s = scratch("extract-nosel");
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.entries.clear();
 
@@ -1220,7 +1227,7 @@ mod tests {
 
     /// An App browsing its own listing, with the cursor on `selected`
     fn app_over(entries: Vec<PathBuf>, selected: usize) -> App {
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.entries = entries;
         app.selected = selected;
         app.scroll_offset = 0;
@@ -1267,7 +1274,7 @@ mod tests {
         fs::write(s.0.join("a.txt"), b"a").unwrap();
         fs::write(s.0.join("b.txt"), b"b").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
         app.mark_all();
@@ -1374,7 +1381,7 @@ mod tests {
         fs::write(s.0.join("outside.txt"), b"x").unwrap();
         fs::write(inside.join("deep.txt"), b"y").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
 
@@ -1406,7 +1413,7 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         fs::write(&gone, b"y").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
         app.marked = vec![file, gone.clone()];
@@ -1439,7 +1446,7 @@ mod tests {
         fs::write(s.0.join("a.txt"), b"one").unwrap();
         fs::write(s.0.join("b.txt"), b"two").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
         app.mark_all();
@@ -1462,7 +1469,7 @@ mod tests {
         fs::write(s.0.join("a.txt"), b"one").unwrap();
         fs::write(s.0.join("b.txt"), b"two").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
         // A member that is not there: tar exits non-zero, which is exactly the
@@ -1482,7 +1489,7 @@ mod tests {
         fs::write(s.0.join("a.txt"), b"one").unwrap();
         fs::write(s.0.join("b.txt"), b"two").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.refresh_entries();
         app.mark_all();
@@ -1514,7 +1521,7 @@ mod tests {
         fs::write(s.0.join("one/a.txt"), b"a").unwrap();
         fs::write(s.0.join("two/b.txt"), b"b").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.marked = vec![s.0.join("one/a.txt"), s.0.join("two/b.txt")];
 
@@ -1533,7 +1540,7 @@ mod tests {
     #[test]
     fn compress_with_nothing_marked_and_nothing_selected_reports_it() {
         let s = scratch("batch-empty");
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.entries.clear();
 
@@ -1551,7 +1558,7 @@ mod tests {
         let file = s.0.join("report.csv");
         fs::write(&file, b"a,b,c").unwrap();
 
-        let mut app = App::new(Lang::builtin());
+        let mut app = App::new(Lang::builtin(), false);
         app.current_dir = s.0.clone();
         app.entries = vec![file];
         app.selected = 0;

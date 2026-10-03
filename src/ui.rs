@@ -11,6 +11,7 @@ use ratatui::{
 use crate::{
     app::{App, Dialog, MarkedSummary, VISIBLE_ROWS},
     i18n::Lang,
+    icons,
 };
 
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
@@ -59,11 +60,11 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .take(VISIBLE_ROWS)
         .map(|(i, path)| {
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let (icon, color) = if path.is_dir() {
-                ("📁", Color::Cyan)
-            } else {
-                ("📄", Color::White)
-            };
+            // The glyph says what the entry is: a Nerd Font one per file type,
+            // or the plain emoji when the terminal has no Nerd Font. The colour
+            // asks the kind alone, so it keeps its cyan folders either way
+            let icon = icons::icon_for(path, app.use_nerd_icons);
+            let color = if path.is_dir() { Color::Cyan } else { Color::White };
             let style = if i == app.selected {
                 Style::default()
                     .fg(Color::Black)
@@ -539,13 +540,19 @@ fn render_dialog(f: &mut Frame, lang: &Lang, dialog: &Dialog) {
 }
 
 /// Columns a single character occupies: control characters take 0 columns,
-/// ASCII / half-width takes 1, CJK and emoji take 2. A deliberate approximation,
-/// not a full UAX#11 implementation
+/// ASCII / half-width takes 1, CJK, emoji and Nerd Font glyphs take 2. A
+/// deliberate approximation, not a full UAX#11 implementation
 fn char_width(c: char) -> usize {
     match c {
         '\u{00}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => 0,
         '\u{200b}'..='\u{200f}' | '\u{feff}' => 0,
         '\u{0300}'..='\u{036f}' => 0,
+        // A Nerd Font glyph is private-use, which the width rules call one
+        // column even though the font that has the glyph draws it across two.
+        // Budgeting the two a real font spends is what keeps the file names
+        // starting on the same column from row to row, so the list lives with
+        // the glyphs themselves rather than in a range nobody can read
+        _ if icons::is_nerd_icon(c) => 2,
         _ if (c as u32) < 0x1100 => 1,
         _ if is_wide(c as u32) => 2,
         _ => 1,
@@ -759,6 +766,18 @@ mod tests {
     /// Every language the shipped config offers
     const LANGS: [&str; 3] = ["zh-cn", "zh-tw", "en-us"];
 
+    /// Whether the cell after `symbol` is a filler the buffer blanked out for it.
+    ///
+    /// A double-width glyph takes two cells and the second one is reset to a
+    /// space, so skipping that cell is what restores the original text. A Nerd
+    /// Font glyph is private-use: `char_width` budgets it two columns, but
+    /// ratatui measures with the Unicode width rules and writes it into a single
+    /// cell, so the cell that follows it holds a real character. Stepping over
+    /// that one would swallow the first letter of the file name
+    fn is_filler(symbol: &str) -> bool {
+        display_width(symbol) == 2 && !symbol.chars().any(icons::is_nerd_icon)
+    }
+
     /// Render one frame and stitch the glyphs into plain text for assertions.
     /// A wide character occupies two cells and the second one is reset to a
     /// space, so skipping it is what restores the original text
@@ -776,7 +795,7 @@ mod tests {
                     continue;
                 }
                 out.push_str(symbol);
-                filler = display_width(symbol) == 2;
+                filler = is_filler(symbol);
             }
             out.push('\n');
         }
@@ -791,7 +810,7 @@ mod tests {
     }
 
     fn with_dialog_in(lang: &Lang, target: &str, is_dir: bool) -> App {
-        let mut app = App::new(lang.clone());
+        let mut app = App::new(lang.clone(), false);
         app.entries.clear();
         app.dialog = Some(Dialog {
             action: DialogAction::Delete,
@@ -822,10 +841,17 @@ mod tests {
         Scratch(dir)
     }
 
-    /// Two files, the first one marked. Nothing touches the disk: the marks are
-    /// absolute paths, so they only have to match the listing
+    /// Two files, the first one marked, drawn with the plain emoji. Nothing
+    /// touches the disk: the marks are absolute paths, so they only have to
+    /// match the listing
     fn app_with_marks(lang: &Lang) -> App {
-        let mut app = App::new(lang.clone());
+        app_with_marks_in(lang, false)
+    }
+
+    /// The same listing with the icon mode spelled out, so a test can check that
+    /// the columns do not move when the Nerd Font glyphs take over
+    fn app_with_marks_in(lang: &Lang, use_nerd: bool) -> App {
+        let mut app = App::new(lang.clone(), use_nerd);
         app.entries = vec![PathBuf::from("alpha.txt"), PathBuf::from("beta.txt")];
         app.selected = 0;
         app.marked = vec![PathBuf::from("alpha.txt")];
@@ -989,7 +1015,7 @@ mod tests {
         for tag in LANGS {
             let lang = lang(tag);
             for (w, h) in [(20u16, 8u16), (40, 10), (60, 14), (80, 24), (200, 50)] {
-                let mut app = App::new(lang.clone());
+                let mut app = App::new(lang.clone(), false);
                 app.last_out = Some(crate::app::OutputInfo {
                     prefix: lang.t("compress.zst.ok"),
                     path: PathBuf::from(r"D:\lazyarchive\lazyzip\BussinGriddyCode.zst"),
@@ -1097,38 +1123,58 @@ mod tests {
         // The left pane is 40% of the terminal, so every column the mark takes is
         // a column off the file name. Measure it against the very same listing
         // with the marks taken away: the difference has to be four, and what is
-        // left has to be the row that was there before
+        // left has to be the row that was there before. Both icon modes go
+        // through it, because a Nerd Font glyph is a private-use codepoint that
+        // the width rules call one column and the font draws across two: if it
+        // were budgeted at one, the names would start one column further left
+        // and the two modes would stop lining up with each other
         for tag in LANGS {
             let lang = lang(tag);
-            for w in [60u16, 80, 120] {
-                let mut marked_app = app_with_marks(&lang);
-                let mut unmarked_app = app_with_marks(&lang);
-                unmarked_app.marked.clear();
+            for use_nerd in [false, true] {
+                for w in [60u16, 80, 120] {
+                    let mut marked_app = app_with_marks_in(&lang, use_nerd);
+                    let mut unmarked_app = app_with_marks_in(&lang, use_nerd);
+                    unmarked_app.marked.clear();
+                    let icon = icons::icon_for(Path::new("alpha.txt"), use_nerd);
 
-                let marked = marked_rows(&render(&mut marked_app, w, 24), w, 24);
-                // The same rows with the mark column lifted off, which is
-                // exactly what the listing looked like before marks existed
-                let plain: Vec<String> = marked_rows(&render(&mut unmarked_app, w, 24), w, 24)
-                    .into_iter()
-                    .map(|row| {
-                        row.strip_prefix("[x] ")
-                            .or_else(|| row.strip_prefix("[ ] "))
-                            .unwrap_or(row.as_str())
-                            .to_string()
-                    })
-                    .collect();
+                    let marked = marked_rows(&render(&mut marked_app, w, 24), w, 24);
+                    // The same rows with the mark column lifted off, which is
+                    // exactly what the listing looked like before marks existed
+                    let plain: Vec<String> = marked_rows(&render(&mut unmarked_app, w, 24), w, 24)
+                        .into_iter()
+                        .map(|row| {
+                            row.strip_prefix("[x] ")
+                                .or_else(|| row.strip_prefix("[ ] "))
+                                .unwrap_or(row.as_str())
+                                .to_string()
+                        })
+                        .collect();
 
-                // Both entries are listed, the marked one first, and the file
-                // name still has room at these widths
-                assert_eq!(marked, vec!["[x] \u{1f4c4} alpha.txt", "[ ] \u{1f4c4} beta.txt"], "{tag} width={w}");
-                assert_eq!(plain, vec!["\u{1f4c4} alpha.txt", "\u{1f4c4} beta.txt"], "{tag} width={w}");
-                // Four columns, no more and no less, on every row
-                for (row, before) in marked.iter().zip(&plain) {
+                    // Both entries are listed, the marked one first, and the file
+                    // name still has room at these widths
                     assert_eq!(
-                        display_width(row),
-                        display_width(before) + 4,
-                        "{tag} width={w}: {row:?} against {before:?}"
+                        marked,
+                        vec![format!("[x] {icon} alpha.txt"), format!("[ ] {icon} beta.txt")],
+                        "{tag} width={w} nerd={use_nerd}"
                     );
+                    assert_eq!(
+                        plain,
+                        vec![format!("{icon} alpha.txt"), format!("{icon} beta.txt")],
+                        "{tag} width={w} nerd={use_nerd}"
+                    );
+                    // Four columns, no more and no less, on every row
+                    for (row, before) in marked.iter().zip(&plain) {
+                        assert_eq!(
+                            display_width(row),
+                            display_width(before) + 4,
+                            "{tag} width={w} nerd={use_nerd}: {row:?} against {before:?}"
+                        );
+                        // ... and the row still fits inside the panel
+                        assert!(
+                            display_width(row) <= inner_width(w),
+                            "{tag} width={w} nerd={use_nerd}: the row spilled past the panel: {row:?}"
+                        );
+                    }
                 }
             }
         }
@@ -1170,7 +1216,7 @@ mod tests {
         // never happen is a row spilling past the border, which would paint over
         // the panel next to it
         let lang = lang("en-us");
-        let mut app = App::new(lang.clone());
+        let mut app = App::new(lang.clone(), false);
         app.entries = vec![PathBuf::from(format!("{}.txt", "n".repeat(200)))];
         app.marked = app.entries.clone();
 
@@ -1314,7 +1360,7 @@ mod tests {
         // whole row belongs to the status bar
         for tag in LANGS {
             let lang = lang(tag);
-            let mut app = App::new(lang.clone());
+            let mut app = App::new(lang.clone(), false);
             app.status = lang.t("status.ready");
             let screen = render(&mut app, 80, 12);
             let row = screen.lines().last().unwrap_or_default();
@@ -1333,6 +1379,38 @@ mod tests {
         // Control characters take no columns
         assert_eq!(display_width("\u{1b}"), 0);
         assert_eq!(display_width("ab\u{1b}c"), 3);
+    }
+
+    #[test]
+    fn nerd_font_icons_are_two_columns_so_the_names_line_up() {
+        // Every glyph the listing can draw is private-use, which the width rules
+        // hand back as one column. A font that has the glyph draws it across
+        // two, so budgeting one would make each row a column shorter than it
+        // looks and the file names would not start in the same place from row to
+        // row. This is the check that keeps that from happening
+        for glyph in icons::ALL {
+            let c = glyph.chars().next().expect("a glyph is one character");
+            assert_eq!(char_width(c), 2, "U+{:04X} should cost two columns", c as u32);
+            assert_eq!(display_width(glyph), 2, "{glyph:?} should cost two columns");
+        }
+        // The glyph plus the space that follows it is the same three columns the
+        // emoji always took, which is what lets the mark column keep measuring
+        // the same in both icon modes
+        let plain_file = icons::icon_for(Path::new("Makefile"), true);
+        let folder = icons::icon_for(Path::new("src"), true);
+        assert_eq!(display_width(&format!("{plain_file} ")), 3);
+        assert_eq!(display_width(&format!("{folder} ")), 3);
+        assert_eq!(display_width(&format!("{} ", icons::FOLDER_EMOJI)), 3);
+
+        // The emoji fallback is untouched: it was two columns before the Nerd
+        // Font glyphs existed and it has to stay two, or switching the icons off
+        // would reflow the whole listing
+        assert_eq!(display_width(icons::FOLDER_EMOJI), 2);
+        assert_eq!(display_width(icons::FILE_EMOJI), 2);
+        assert_eq!(display_width("\u{1f4c1} \u{1f4c4}"), 5);
+        // Ordinary text around a glyph is still one column per character
+        let rust = icons::icon_for(Path::new("main.rs"), true);
+        assert_eq!(display_width(&format!("a{rust}b")), 4);
     }
 
     #[test]
