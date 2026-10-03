@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Dialog, VISIBLE_ROWS},
+    app::{App, Dialog, MarkedSummary, VISIBLE_ROWS},
     i18n::Lang,
 };
 
@@ -47,7 +47,10 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(chunks[1]);
 
-    // Left: file tree
+    // Left: file tree. A leading `[x] ` / `[ ] ` column says at a glance which
+    // entries a batch would take; it costs four columns, which the narrow left
+    // pane can afford because the name simply gets clipped at the panel edge
+    let marked = &app.marked;
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -69,7 +72,16 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             } else {
                 Style::default().fg(color)
             };
+            // The mark keeps its own colour even on the selected row, exactly
+            // like the icon does: which entries are in the batch is the one thing
+            // that must stay readable while the cursor is on it
+            let (mark, mark_style) = if marked.contains(path) {
+                ("[x] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                ("[ ] ", Style::default().fg(Color::DarkGray))
+            };
             ListItem::new(Line::from(vec![
+                Span::styled(mark, mark_style),
                 Span::styled(format!("{} ", icon), Style::default().fg(color)),
                 Span::styled(name, style),
             ]))
@@ -161,22 +173,31 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(key_hint, chunks[2]);
 
     // Bottom: progress / status, owning its own row so it never overlaps the
-    // widgets above
+    // widgets above. The mark counter is measured first and the row is split
+    // around it, so the status text below is truncated against exactly the
+    // columns the counter does not claim
+    let counter = marked_counter(lang, app.marked_summary(), chunks[3].width as usize);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            // Nothing marked means nothing claimed: the counter costs no columns
+            Constraint::Length(counter.as_ref().map_or(0, |line| {
+                line.spans.iter().map(|s| display_width(&s.content)).sum::<usize>() as u16
+            })),
+        ])
+        .split(chunks[3]);
+
     let gauge = match app.job.as_ref() {
         Some(job) => {
-            let name = job
-                .target
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = &job.label;
             let secs = job.started.elapsed().as_secs().to_string();
             // The detected format leads the label, so the user can see what the
             // magic bytes turned out to be
             let text = if job.kind.is_extract() {
-                lang.tf("status.extracting", &[&job.format, &name, &secs])
+                lang.tf("status.extracting", &[&job.format, name, &secs])
             } else {
-                lang.tf("status.compressing", &[&job.format, &name, &secs])
+                lang.tf("status.compressing", &[&job.format, name, &secs])
             };
             Gauge::default()
                 .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
@@ -189,7 +210,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             // when it does not fit, elide the path to  drive:\...name.ext
             let text = match app.last_out.as_ref() {
                 Some(o) => {
-                    let area = chunks[3];
+                    let area = bottom[0];
                     let head = format!("{} {}: ", lang.t("status.label"), o.prefix);
                     let tail = format!("  {} {}", lang.t("status.size_field"), o.size);
                     let fixed = display_width(&head) + display_width(&tail);
@@ -204,7 +225,7 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
                 // it can never spill out of the row
                 None => truncate_to_width(
                     &format!("{} {}", lang.t("status.label"), app.status),
-                    chunks[3].width as usize,
+                    bottom[0].width as usize,
                 ),
             };
             Gauge::default()
@@ -215,12 +236,60 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         }
     };
 
-    f.render_widget(gauge, chunks[3]);
+    f.render_widget(gauge, bottom[0]);
+
+    if let Some(line) = counter {
+        // Right-aligned against the screen edge, on the same background as the
+        // Gauge so the row reads as one bar rather than two
+        f.render_widget(
+            Paragraph::new(line)
+                .alignment(Alignment::Right)
+                .style(Style::default().bg(Color::DarkGray)),
+            bottom[1],
+        );
+    }
 
     // The dialog is drawn last: dim the whole screen, then stack the centered
     // confirmation on top
     if let Some(dialog) = app.dialog.as_ref() {
         render_dialog(f, lang, dialog);
+    }
+}
+
+/// Columns the status text is guaranteed before the corner counter may compete
+/// for the rest of the row.
+///
+/// The two share one line, so a counter that claims everything leaves a status
+/// bar clipped down to its own label. What it says is the news; the count is
+/// only an aid, so the status goes first
+const MIN_STATUS_WIDTH: usize = 16;
+
+/// The mark counter for the bottom-right corner, already cut down to what the row
+/// can hold.
+///
+/// Three steps down and then silence: the count with its breakdown, the count
+/// alone, and nothing. The row is a single line shared with the status bar, so a
+/// counter that overflowed it would push the status out of the terminal; dropping
+/// the breakdown first is what keeps the number itself on screen
+fn marked_counter(lang: &Lang, summary: Option<MarkedSummary>, width: usize) -> Option<Line<'static>> {
+    let summary = summary?;
+    let count = Span::styled(
+        summary.count(lang),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    );
+    let detail = Span::styled(summary.detail(lang), Style::default().fg(Color::DarkGray));
+
+    // Both halves are measured on display width, so a Chinese breakdown costs
+    // twice as many columns as an English one
+    let spare = width.saturating_sub(MIN_STATUS_WIDTH);
+    let full = display_width(&count.content) + display_width(&detail.content);
+    if full <= spare {
+        Some(Line::from(vec![count, detail]))
+    } else if display_width(&count.content) <= spare {
+        Some(Line::from(vec![count]))
+    } else {
+        // Not even the count fits; say nothing rather than spill out of the row
+        None
     }
 }
 
@@ -234,7 +303,7 @@ fn key_hint_line(lang: &Lang, width: usize) -> Line<'static> {
     };
     // (tier, group): a lower tier claims space first, and a group that does not
     // fit is skipped whole
-    let groups: [(u8, Vec<Span<'static>>); 5] = [
+    let groups: [(u8, Vec<Span<'static>>); 6] = [
         (
             0,
             vec![
@@ -245,6 +314,16 @@ fn key_hint_line(lang: &Lang, width: usize) -> Line<'static> {
                 Span::styled(" b:zst ", Style::default().fg(Color::Red)),
                 Span::styled(" n:gz ", Style::default().fg(Color::Blue)),
                 Span::styled(" m:xz ", Style::default().fg(Color::LightRed)),
+            ],
+        ),
+        (
+            0,
+            // `Space` and `A` build up the batch a single key press then packs,
+            // so they rank just below the format keys and `d` / `e`: they go
+            // together or not at all
+            vec![
+                chip("Space", "key.mark", Style::default().fg(Color::Green)),
+                chip("A", "key.mark_all", Style::default().fg(Color::Green)),
             ],
         ),
         (
@@ -743,21 +822,101 @@ mod tests {
         Scratch(dir)
     }
 
+    /// Two files, the first one marked. Nothing touches the disk: the marks are
+    /// absolute paths, so they only have to match the listing
+    fn app_with_marks(lang: &Lang) -> App {
+        let mut app = App::new(lang.clone());
+        app.entries = vec![PathBuf::from("alpha.txt"), PathBuf::from("beta.txt")];
+        app.selected = 0;
+        app.marked = vec![PathBuf::from("alpha.txt")];
+        app
+    }
+
+    /// Columns inside the left panel's border, laid out exactly as `ui` does it.
+    /// Reading the real layout instead of hand-counting keeps the assertion from
+    /// drifting away from the widget it is checking
+    fn inner_width(w: u16) -> usize {
+        let area = Rect::new(0, 0, w, 24);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let mid = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(rows[1]);
+        (mid[0].width.saturating_sub(2)) as usize
+    }
+
+    /// The vertical rule the panels are drawn with, and the doubled one the
+    /// dialog uses. Written as escapes so the test reads in plain ASCII
+    const BORDER: char = '\u{2502}';
+    const DOUBLE_BORDER: char = '\u{2551}';
+
+    /// What sits inside the left panel's border on every row, leading border
+    /// stepped over. Counting columns rather than splitting on the border glyph
+    /// is what keeps this correct in the presence of two-column characters
+    fn panel_rows(screen: &str, w: u16, h: u16) -> Vec<String> {
+        let inner = inner_width(w);
+        screen
+            .lines()
+            .take(h as usize)
+            .filter_map(|line| {
+                let inside = line.strip_prefix(BORDER)?;
+                let mut cell = String::new();
+                let mut used = 0;
+                for c in inside.chars() {
+                    if used >= inner || matches!(c, BORDER | DOUBLE_BORDER) {
+                        break;
+                    }
+                    used += char_width(c);
+                    cell.push(c);
+                }
+                Some(cell.trim_end().to_string())
+            })
+            .collect()
+    }
+
+    /// The file rows of a rendered screen: the ones carrying a mark column
+    fn marked_rows(screen: &str, w: u16, h: u16) -> Vec<String> {
+        panel_rows(screen, w, h)
+            .into_iter()
+            .filter(|cell| cell.starts_with("[x] ") || cell.starts_with("[ ] "))
+            .collect()
+    }
+
     #[test]
     fn key_hint_never_overflows_its_row() {
         // English copy is where the hint is widest, so check every language
         for tag in LANGS {
             let lang = lang(tag);
-            for width in [4usize, 10, 20, 40, 56, 70, 78, 80, 100, 120, 200] {
+            // Every single width, not a sample: the mark chips widened tier 0 by
+            // about twenty columns, so the exact drop point moved
+            for width in 4usize..=200 {
                 let line = key_hint_line(&lang, width);
                 let w: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
                 // The border takes two columns; the hints must fit inside the row
                 assert!(w <= width.saturating_sub(2), "{tag} width={width} actual={w}");
             }
-            // On a wide terminal the compression keys, `d` and `e` are present
-            let full = key_hint_line(&lang, 120);
+            // On a wide terminal the compression keys, the mark keys, `d` and `e`
+            // are all present
+            let full = key_hint_line(&lang, 200);
             let text: String = full.spans.iter().map(|s| s.content.to_string()).collect();
             assert!(text.contains("z:tar"), "{tag}: {text}");
+            assert!(text.contains("x:zip"), "{tag}: {text}");
+            assert!(
+                text.contains(&format!("Space:{}", lang.t("key.mark"))),
+                "{tag}: {text}"
+            );
+            assert!(
+                text.contains(&format!("A:{}", lang.t("key.mark_all"))),
+                "{tag}: {text}"
+            );
             assert!(
                 text.contains(&format!("d:{}", lang.t("key.delete"))),
                 "{tag}: {text}"
@@ -766,6 +925,25 @@ mod tests {
                 text.contains(&format!("e:{}", lang.t("key.extract"))),
                 "{tag}: {text}"
             );
+        }
+    }
+
+    #[test]
+    fn the_mark_keys_come_and_go_together() {
+        // `Space` alone cannot build a batch without `A`, so they share one group
+        // and are dropped whole, exactly as `d` and `e` are
+        for tag in LANGS {
+            let lang = lang(tag);
+            for width in 4usize..=200 {
+                let text: String = key_hint_line(&lang, width)
+                    .spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect();
+                let has_space = text.contains(&format!("Space:{}", lang.t("key.mark")));
+                let has_all = text.contains(&format!("A:{}", lang.t("key.mark_all")));
+                assert!(has_space == has_all, "{tag} width={width}: {text}");
+            }
         }
     }
 
@@ -911,6 +1089,238 @@ mod tests {
                 let screen = render(&mut app, w, h);
                 assert_eq!(screen.lines().count(), h as usize, "{tag} {w}x{h}: wrong row count");
             }
+        }
+    }
+
+    #[test]
+    fn the_mark_column_costs_exactly_four_columns() {
+        // The left pane is 40% of the terminal, so every column the mark takes is
+        // a column off the file name. Measure it against the very same listing
+        // with the marks taken away: the difference has to be four, and what is
+        // left has to be the row that was there before
+        for tag in LANGS {
+            let lang = lang(tag);
+            for w in [60u16, 80, 120] {
+                let mut marked_app = app_with_marks(&lang);
+                let mut unmarked_app = app_with_marks(&lang);
+                unmarked_app.marked.clear();
+
+                let marked = marked_rows(&render(&mut marked_app, w, 24), w, 24);
+                // The same rows with the mark column lifted off, which is
+                // exactly what the listing looked like before marks existed
+                let plain: Vec<String> = marked_rows(&render(&mut unmarked_app, w, 24), w, 24)
+                    .into_iter()
+                    .map(|row| {
+                        row.strip_prefix("[x] ")
+                            .or_else(|| row.strip_prefix("[ ] "))
+                            .unwrap_or(row.as_str())
+                            .to_string()
+                    })
+                    .collect();
+
+                // Both entries are listed, the marked one first, and the file
+                // name still has room at these widths
+                assert_eq!(marked, vec!["[x] \u{1f4c4} alpha.txt", "[ ] \u{1f4c4} beta.txt"], "{tag} width={w}");
+                assert_eq!(plain, vec!["\u{1f4c4} alpha.txt", "\u{1f4c4} beta.txt"], "{tag} width={w}");
+                // Four columns, no more and no less, on every row
+                for (row, before) in marked.iter().zip(&plain) {
+                    assert_eq!(
+                        display_width(row),
+                        display_width(before) + 4,
+                        "{tag} width={w}: {row:?} against {before:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_panel_clips_the_name_and_never_the_mark() {
+        // Once the pane is too narrow for the name, the name is what goes: the
+        // mark column and the icon stay, because they are the only way to tell
+        // which entries a batch would take
+        for tag in LANGS {
+            let lang = lang(tag);
+            for w in [24u16, 40] {
+                let mut app = app_with_marks(&lang);
+                let screen = render(&mut app, w, 24);
+                let rows = marked_rows(&screen, w, 24);
+                assert_eq!(rows.len(), 2, "{tag} width={w}: {rows:?}");
+                for (row, full) in rows.iter().zip(["[x] \u{1f4c4} alpha.txt", "[ ] \u{1f4c4} beta.txt"]) {
+                    assert!(
+                        row.starts_with("[x] ") || row.starts_with("[ ] "),
+                        "{tag} width={w}: the mark must survive: {row:?}"
+                    );
+                    assert!(
+                        full.starts_with(row.as_str()),
+                        "{tag} width={w}: clipping must cut from the right: {row:?}"
+                    );
+                    assert!(
+                        display_width(row) <= inner_width(w),
+                        "{tag} width={w}: the row spilled past the panel: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_name_is_clipped_at_the_panel_edge_and_nowhere_else() {
+        // The name is allowed to run out of room: the panel clips it. What must
+        // never happen is a row spilling past the border, which would paint over
+        // the panel next to it
+        let lang = lang("en-us");
+        let mut app = App::new(lang.clone());
+        app.entries = vec![PathBuf::from(format!("{}.txt", "n".repeat(200)))];
+        app.marked = app.entries.clone();
+
+        for w in [8u16, 20, 40, 80] {
+            let screen = render(&mut app, w, 20);
+            assert_eq!(screen.lines().count(), 20, "width={w}: wrong row count");
+            // Nothing paints past the terminal's own last column, whatever the
+            // width
+            for (i, line) in screen.lines().enumerate() {
+                assert!(display_width(line) <= w as usize, "width={w} row{i}: {line:?}");
+            }
+            // Below four columns of pane there is no mark column left to check,
+            // but the row still has to fit inside the border
+            if inner_width(w) < 4 {
+                continue;
+            }
+            let rows = marked_rows(&screen, w, 20);
+            let row = rows.first().unwrap_or_else(|| panic!("width={w}: no row"));
+            // The mark leads the row, so it is never the part that gets clipped
+            assert!(row.starts_with("[x] "), "width={w}: {row:?}");
+            assert!(
+                display_width(row) <= inner_width(w),
+                "width={w}: the row spilled past the panel: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corner_counter_degrades_in_three_steps() {
+        let lang = lang("en-us");
+        let summary = MarkedSummary {
+            total: 12,
+            files: 10,
+            dirs: 2,
+        };
+        let count = summary.count(&lang);
+        let detail = summary.detail(&lang);
+
+        // Wide enough for both halves: the full phrase, split into two spans so
+        // the count and the breakdown can be styled differently
+        let full = marked_counter(&lang, Some(summary), 200).expect("wide enough");
+        let spans = &full.spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, count);
+        assert_eq!(spans[1].content, detail);
+
+        // Enough for the count alone: the breakdown goes and the number stays,
+        // because the number is what the user is actually counting. The status
+        // keeps its columns either way, which is what the extra width is for
+        let just_the_count = display_width(&count) + MIN_STATUS_WIDTH;
+        let short = marked_counter(&lang, Some(summary), just_the_count).expect("count fits");
+        assert_eq!(short.spans.len(), 1);
+        assert_eq!(short.spans[0].content, count);
+
+        // One column short of that: say nothing at all rather than spill out
+        assert!(marked_counter(&lang, Some(summary), just_the_count - 1).is_none());
+        assert!(marked_counter(&lang, Some(summary), 0).is_none());
+
+        // Nothing marked: no counter, so the row stays exactly as wide as it was
+        assert!(marked_counter(&lang, None, 200).is_none());
+    }
+
+    #[test]
+    fn the_corner_counter_never_starves_the_status_bar() {
+        // The counter is an aid, the status is the news: a row too narrow for
+        // both has to give up the breakdown, and then the count
+        let lang = lang("zh-cn");
+        let summary = MarkedSummary { total: 3, files: 3, dirs: 0 };
+        let breakdown = display_width(&summary.detail(&lang));
+
+        for row in 0usize..=120 {
+            let line = marked_counter(&lang, Some(summary), row);
+            let used: usize = line
+                .as_ref()
+                .map_or(0, |l| l.spans.iter().map(|s| display_width(&s.content)).sum());
+            assert!(used <= row, "width={row}: used={used}");
+
+            // Whatever is kept leaves the status its own columns
+            let halves = line.map_or(0, |l| l.spans.len());
+            assert!(
+                halves == 0 || row - used >= MIN_STATUS_WIDTH,
+                "width={row}: the counter left the status {} columns",
+                row - used
+            );
+            // The breakdown is the first thing to go: a row that only holds the
+            // count keeps the count and nothing else
+            assert!(
+                halves != 2 || display_width(&summary.count(&lang)) + breakdown <= row - MIN_STATUS_WIDTH,
+                "width={row}: the breakdown was kept when the count alone would have done"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corner_counter_never_overflows_the_bottom_row() {
+        for tag in LANGS {
+            let lang = lang(tag);
+            let summary = MarkedSummary {
+                total: 1234,
+                files: 1200,
+                dirs: 34,
+            };
+            for w in 0usize..=120 {
+                if let Some(line) = marked_counter(&lang, Some(summary), w) {
+                    let used: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+                    assert!(used <= w, "{tag} width={w}: used={used}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_corner_counter_shares_the_row_with_the_status_without_spilling() {
+        for tag in LANGS {
+            let lang = lang(tag);
+            for w in [12u16, 24, 40, 60, 80, 120, 200] {
+                let mut app = app_with_marks(&lang);
+                // A long status, which is what the row has to survive sharing
+                app.status = lang.tf("status.deleted", &["File", r"D:\a\b\c.txt"]);
+                let screen = render(&mut app, w, 12);
+                let row = screen.lines().last().unwrap_or_default();
+                assert!(
+                    display_width(row.trim_end()) <= w as usize,
+                    "{tag} width={w}: {row:?}"
+                );
+            }
+
+            // At a comfortable width the whole phrase is there, flush against the
+            // right edge, with the breakdown last
+            let mut app = app_with_marks(&lang);
+            let detail = app.marked_summary().expect("one mark").detail(&lang);
+            let screen = render(&mut app, 200, 12);
+            let row = screen.lines().last().unwrap_or_default();
+            assert!(row.trim_end().ends_with(&detail), "{tag}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn an_unmarked_run_shows_no_counter_at_all() {
+        // Zero marked entries must cost nothing: no digits, no label, and the
+        // whole row belongs to the status bar
+        for tag in LANGS {
+            let lang = lang(tag);
+            let mut app = App::new(lang.clone());
+            app.status = lang.t("status.ready");
+            let screen = render(&mut app, 80, 12);
+            let row = screen.lines().last().unwrap_or_default();
+            assert!(!row.contains("Marked"), "{tag}: {row:?}");
+            assert!(!row.contains("已标记"), "{tag}: {row:?}");
+            assert!(!row.contains("已標記"), "{tag}: {row:?}");
         }
     }
 

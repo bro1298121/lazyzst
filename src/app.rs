@@ -10,7 +10,7 @@ use std::{
 use anyhow::Context;
 
 use crate::{
-    compress::{build_command, format_spec},
+    compress::{build_command, format_spec, same_parent},
     extract::{build_extract_command, detect_format, extract_target, probe_nested, Format},
     i18n::Lang,
     ui::format_size,
@@ -53,6 +53,9 @@ pub(crate) struct JobState {
     /// detection when extracting
     pub(crate) format: String,
     pub(crate) target: PathBuf,
+    /// What the Gauge names while the job runs. A compression shows the input it
+    /// was given, or the archive being written when there are several
+    pub(crate) label: String,
     pub(crate) started: Instant,
     /// Animated indeterminate progress (external tools report no real percentage)
     pub(crate) progress: u16,
@@ -71,6 +74,44 @@ pub(crate) struct OutputInfo {
     pub(crate) prefix: String,
     pub(crate) path: PathBuf,
     pub(crate) size: String,
+}
+
+/// What the marked set adds up to.
+///
+/// The two phrases are kept apart rather than glued together because the UI drops
+/// the breakdown when its row is too narrow for it, while the status line keeps
+/// both. Counting once and rendering twice is what keeps the corner counter and
+/// the status text from ever disagreeing
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MarkedSummary {
+    /// Marked entries in total, files and directories together
+    pub(crate) total: usize,
+    /// How many of them are files
+    pub(crate) files: usize,
+    /// How many of them are directories
+    pub(crate) dirs: usize,
+}
+
+impl MarkedSummary {
+    /// Short phrase: `已标记 3 项`
+    pub(crate) fn count(&self, lang: &Lang) -> String {
+        lang.tf("status.marked_count", &[&self.total.to_string()])
+    }
+
+    /// Breakdown only: `（2 文件 · 1 文件夹）`. It carries its own leading space
+    /// and brackets, because where punctuation goes around an interpolated count
+    /// is a question each language answers differently
+    pub(crate) fn detail(&self, lang: &Lang) -> String {
+        lang.tf(
+            "status.marked_files_dirs",
+            &[&self.files.to_string(), &self.dirs.to_string()],
+        )
+    }
+
+    /// Both halves joined, for the status line and for a row wide enough
+    pub(crate) fn full(&self, lang: &Lang) -> String {
+        format!("{}{}", self.count(lang), self.detail(lang))
+    }
 }
 
 /// What a dialog does. Deletion is the only action so far; add a variant here
@@ -112,6 +153,13 @@ pub(crate) struct App {
     /// a timer and measuring a directory means walking it, so the result is held
     /// until the selection moves or the listing is refreshed
     pub(crate) size_cache: Option<(PathBuf, String)>,
+    /// Paths the user has marked, in the order they were marked.
+    ///
+    /// A `Vec` and not a set: the order decides the argument order of the batch
+    /// command, and that order has to come out the same on every run rather than
+    /// depending on a hash. Stored as absolute paths, so a mark survives
+    /// navigating away and back, and is unrelated to the listing it was made from
+    pub(crate) marked: Vec<PathBuf>,
 }
 
 impl App {
@@ -131,6 +179,7 @@ impl App {
             last_out: None,
             dialog: None,
             size_cache: None,
+            marked: Vec::new(),
         }
     }
 
@@ -192,6 +241,108 @@ impl App {
 
     pub(crate) fn get_selected_path(&self) -> Option<PathBuf> {
         self.entries.get(self.selected).cloned()
+    }
+
+    /// What a compression acts on: the marked entries when there are any,
+    /// otherwise whatever is selected, which is what keeps the plain
+    /// single-target keys working exactly as before.
+    ///
+    /// The marked paths come back in the order they were marked
+    pub(crate) fn targets(&self) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            self.get_selected_path().into_iter().collect()
+        } else {
+            self.marked.clone()
+        }
+    }
+
+    /// What the marked set adds up to, or `None` when nothing is marked
+    pub(crate) fn marked_summary(&self) -> Option<MarkedSummary> {
+        if self.marked.is_empty() {
+            return None;
+        }
+        let dirs = self.marked.iter().filter(|p| p.is_dir()).count();
+        Some(MarkedSummary {
+            total: self.marked.len(),
+            files: self.marked.len() - dirs,
+            dirs,
+        })
+    }
+
+    /// `Space`: mark the selected entry, or take the mark off again
+    pub(crate) fn toggle_mark(&mut self) {
+        let Some(path) = self.get_selected_path() else {
+            self.status = self.lang.t("status.nothing_selected");
+            return;
+        };
+
+        match self.marked.iter().position(|p| p == &path) {
+            Some(at) => {
+                // Remove by position: the remaining marks keep the order they
+                // were made in, which the batch command's arguments inherit
+                self.marked.remove(at);
+                self.status = self.lang.tf("status.unmarked", &[&self.marked.len().to_string()]);
+            }
+            None => {
+                self.marked.push(path);
+                self.status = self.marked_summary()
+                    .map(|s| s.full(&self.lang))
+                    .unwrap_or_else(|| self.lang.t("status.ready"));
+            }
+        }
+    }
+
+    /// `A`: mark everything the current directory holds, directories included.
+    /// Already-marked entries keep their place in the order, so re-running this
+    /// does not reshuffle the batch
+    pub(crate) fn mark_all(&mut self) {
+        if self.entries.is_empty() {
+            self.status = self.lang.t("status.nothing_selected");
+            return;
+        }
+
+        // Gather first, then append: entries that are already marked keep the
+        // slot they were given, so running this twice cannot reshuffle the batch
+        let fresh: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|p| !self.marked.contains(p))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            self.status = self.lang.t("status.already_marked");
+            return;
+        }
+        self.marked.extend(fresh);
+        self.status = self.marked_summary()
+            .map(|s| s.full(&self.lang))
+            .unwrap_or_else(|| self.lang.t("status.ready"));
+    }
+
+    /// `u`: take the mark off the selected entry. Not an undo stack: it only
+    /// ever touches whatever is under the cursor
+    pub(crate) fn unmark_selected(&mut self) {
+        let Some(path) = self.get_selected_path() else {
+            self.status = self.lang.t("status.nothing_selected");
+            return;
+        };
+        let Some(at) = self.marked.iter().position(|p| p == &path) else {
+            self.status = self.lang.t("status.not_marked");
+            return;
+        };
+        self.marked.remove(at);
+        self.status = self.lang.tf("status.unmarked", &[&self.marked.len().to_string()]);
+    }
+
+    /// `U`: drop every mark at once
+    pub(crate) fn clear_marks(&mut self) {
+        if self.marked.is_empty() {
+            self.status = self.lang.t("status.nothing_marked");
+            return;
+        }
+        let had = self.marked.len();
+        self.marked.clear();
+        self.status = self.lang.tf("status.marks_cleared", &[&had.to_string()]);
     }
 
     /// `d`: open the delete confirmation. When the preconditions fail it only
@@ -279,12 +430,30 @@ impl App {
             return;
         }
 
-        let Some(path) = self.get_selected_path() else {
+        // Marks win over the selection: they are how a batch is built up, and
+        // with none of them this is the single-target path it always was
+        let targets = self.targets();
+        if targets.is_empty() {
             self.status = self.lang.t("status.nothing_selected");
             return;
-        };
+        }
 
-        let (mut cmd, out) = match build_command(format, &path) {
+        // wim captures one directory. Its `dism` invocation names a single
+        // capture dir, so a batch would write an image of whichever entry it
+        // read first and report success while losing the rest
+        if targets.len() > 1 && format == "wim" {
+            self.status = self.lang.t("status.wim_batch_unsupported");
+            return;
+        }
+
+        // One archive lives beside its members and every tool is handed bare
+        // member names, so entries from two directories have no common spelling
+        if targets.len() > 1 && !same_parent(&targets) {
+            self.status = self.lang.t("status.marks_mixed_dirs");
+            return;
+        }
+
+        let (mut cmd, out) = match build_command(format, &targets) {
             Ok(built) => built,
             Err(e) => {
                 self.status = format!("{}: {}", self.lang.t("status.error"), e);
@@ -302,10 +471,20 @@ impl App {
             }
         };
 
+        // A batch has no single input worth showing while it runs, so the Gauge
+        // names the archive being written instead
+        let named = if targets.len() == 1 { &targets[0] } else { &out };
+        let label = named
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
         self.job = Some(JobState {
             kind: JobKind::Compress,
             format: format.to_string(),
-            target: path,
+            target: targets[0].clone(),
+            label,
             started: Instant::now(),
             progress: 0,
             child,
@@ -364,10 +543,16 @@ impl App {
         let out = extract_target(format, &path, &dest);
         let name = path.display().to_string();
         let label = format.to_string();
+        let gauge_label = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         self.job = Some(JobState {
             kind: JobKind::Extract(format),
             format: label.clone(),
             target: path,
+            label: gauge_label,
             started: Instant::now(),
             progress: 0,
             child,
@@ -468,6 +653,10 @@ impl App {
                     "status.output",
                     &[&ok_prefix, &job.out.display().to_string(), &size],
                 );
+                // The batch is inside that archive now, so the marks have done
+                // their job. Only on success: a failed run keeps them, so the
+                // same selection can simply be tried again
+                self.marked.clear();
             } else {
                 // On failure keep no output info, so the status bar shows the
                 // failure message instead
@@ -1017,5 +1206,362 @@ mod tests {
 
         assert!(app.job.is_none());
         assert_eq!(app.status, app.lang.t("status.extract_cancelled"));
+    }
+
+    // ---- marks ----
+    /// A listing holding `files` and `dirs`, sorted the way `read_dir` sorts:
+    /// directories first, then by name
+    fn listing_with(files: &[&str], dirs: &[&str]) -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+        entries.extend(files.iter().map(PathBuf::from));
+        entries.sort();
+        entries
+    }
+
+    /// An App browsing its own listing, with the cursor on `selected`
+    fn app_over(entries: Vec<PathBuf>, selected: usize) -> App {
+        let mut app = App::new(Lang::builtin());
+        app.entries = entries;
+        app.selected = selected;
+        app.scroll_offset = 0;
+        app
+    }
+
+    #[test]
+    fn space_toggles_the_mark_on_the_selected_entry() {
+        let entries = listing_with(&["a.txt", "b.txt"], &[]);
+        let mut app = app_over(entries, 0);
+
+        app.toggle_mark();
+        assert_eq!(app.marked, vec![PathBuf::from("a.txt")]);
+        let marked_status = app.status.clone();
+
+        // Pressing it again takes the mark back off
+        app.toggle_mark();
+        assert!(app.marked.is_empty(), "the second press has to unmark");
+        assert_ne!(app.status, marked_status, "the change has to be visible");
+        assert_eq!(
+            app.status,
+            app.lang.tf("status.unmarked", &["0"]),
+            "status={}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_toggle_with_no_selection_says_so_instead_of_doing_nothing() {
+        let mut app = app_over(Vec::new(), 0);
+
+        app.toggle_mark();
+
+        assert!(app.marked.is_empty());
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn capital_a_marks_every_entry_including_the_directories() {
+        // Real files and a real directory: the summary splits the set by kind,
+        // which means asking the filesystem what each entry actually is
+        let s = scratch("mark-all");
+        fs::create_dir_all(s.0.join("dir")).unwrap();
+        fs::write(s.0.join("a.txt"), b"a").unwrap();
+        fs::write(s.0.join("b.txt"), b"b").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+        app.mark_all();
+
+        assert_eq!(app.marked.len(), 3, "directories count too");
+        let summary = app.marked_summary().expect("something is marked");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.dirs, 1);
+        assert_eq!(summary.files, 2);
+        assert_eq!(app.status, summary.full(&app.lang));
+
+        // Running it again adds nothing and says so rather than looking like it
+        // worked; the order also has to survive, since it is the batch order
+        let before = app.marked.clone();
+        app.mark_all();
+        assert_eq!(app.marked, before, "the order must not be reshuffled");
+        assert_eq!(app.status, app.lang.t("status.already_marked"));
+    }
+
+    #[test]
+    fn capital_a_with_nothing_to_mark_says_so() {
+        let mut app = app_over(Vec::new(), 0);
+
+        app.mark_all();
+
+        assert!(app.marked.is_empty());
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn lower_u_drops_only_the_entry_under_the_cursor() {
+        let entries = listing_with(&["a.txt", "b.txt", "c.txt"], &[]);
+        let mut app = app_over(entries, 1);
+        app.marked = vec![PathBuf::from("b.txt"), PathBuf::from("a.txt")];
+
+        app.unmark_selected();
+
+        // Not an undo stack: it took `b.txt` and left the rest exactly as they were
+        assert_eq!(app.marked, vec![PathBuf::from("a.txt")]);
+        assert_eq!(app.status, app.lang.tf("status.unmarked", &["1"]));
+
+        // Pressing it on an unmarked entry reports rather than pretending
+        app.unmark_selected();
+        assert_eq!(app.marked, vec![PathBuf::from("a.txt")]);
+        assert_eq!(app.status, app.lang.t("status.not_marked"));
+    }
+
+    #[test]
+    fn lower_u_with_no_selection_says_so() {
+        let mut app = app_over(Vec::new(), 0);
+
+        app.unmark_selected();
+
+        assert!(app.marked.is_empty());
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn capital_u_clears_every_mark_and_reports_what_went_away() {
+        let entries = listing_with(&["a.txt", "b.txt"], &[]);
+        let mut app = app_over(entries, 0);
+        app.marked = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
+
+        app.clear_marks();
+
+        assert!(app.marked.is_empty());
+        assert_eq!(app.status, app.lang.tf("status.marks_cleared", &["2"]));
+        assert!(app.marked_summary().is_none(), "nothing is marked any more");
+
+        // Clearing an empty set is a no-op, and says so
+        app.clear_marks();
+        assert_eq!(app.status, app.lang.t("status.nothing_marked"));
+    }
+
+    #[test]
+    fn targets_fall_back_to_the_selection_only_while_nothing_is_marked() {
+        let entries = listing_with(&["a.txt", "b.txt"], &[]);
+        let mut app = app_over(entries, 1);
+        assert_eq!(app.targets(), vec![PathBuf::from("b.txt")]);
+
+        // Marked entries win, and come back in the order they were marked rather
+        // than in listing order, so the batch arguments are reproducible
+        app.marked = vec![PathBuf::from("b.txt"), PathBuf::from("a.txt")];
+        assert_eq!(app.targets(), vec![PathBuf::from("b.txt"), PathBuf::from("a.txt")]);
+
+        // Clearing them hands the plain keys back to the selection
+        app.clear_marks();
+        assert_eq!(app.targets(), vec![PathBuf::from("b.txt")]);
+    }
+
+    #[test]
+    fn targets_are_empty_with_nothing_marked_and_nothing_selected() {
+        let app = app_over(Vec::new(), 0);
+
+        assert!(app.targets().is_empty());
+        assert!(app.marked_summary().is_none());
+    }
+
+    #[test]
+    fn marks_survive_navigating_into_a_directory_and_back_out() {
+        let s = scratch("marks-nav");
+        let inside = s.0.join("inner");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(s.0.join("outside.txt"), b"x").unwrap();
+        fs::write(inside.join("deep.txt"), b"y").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+
+        // Mark the two entries of the directory being browsed
+        app.mark_all();
+        let marked = app.marked.clone();
+        assert_eq!(marked.len(), 2);
+
+        // Down one level: the marks are absolute, so they do not travel with the
+        // listing and cannot be clobbered by the refresh
+        app.enter_dir();
+        assert_eq!(app.current_dir, inside);
+        assert_eq!(app.marked, marked, "marks must survive a directory change");
+        assert_eq!(app.entries.len(), 1, "the new listing is what changed");
+
+        // And back out again
+        app.go_up();
+        assert_eq!(app.current_dir, s.0);
+        assert_eq!(app.marked, marked, "marks must survive going back");
+    }
+
+    #[test]
+    fn a_marked_entry_that_vanishes_from_the_listing_still_counts() {
+        // Marks are absolute paths, not row indices, so a refresh that drops the
+        // entry does not silently shrink the batch behind the user's back
+        let s = scratch("marks-stale");
+        let file = s.0.join("here.txt");
+        let gone = s.0.join("gone.txt");
+        fs::write(&file, b"x").unwrap();
+        fs::write(&gone, b"y").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+        app.marked = vec![file, gone.clone()];
+        assert_eq!(app.marked_summary().unwrap().total, 2);
+
+        fs::remove_file(&gone).unwrap();
+        app.refresh_entries();
+
+        assert!(!app.entries.contains(&gone));
+        assert_eq!(app.marked.len(), 2, "the mark outlived its listing row");
+    }
+
+    // ---- batch compression ----
+    /// Poll until the running job has been collected. `try_wait` never blocks, so
+    /// this is the same shape as the main loop's tick
+    fn drain(app: &mut App) {
+        for _ in 0..400 {
+            if app.job.is_none() {
+                return;
+            }
+            app.poll_job();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the job never finished");
+    }
+
+    #[test]
+    fn a_marked_batch_packs_every_entry_and_clears_the_marks() {
+        let s = scratch("batch-run");
+        fs::write(s.0.join("a.txt"), b"one").unwrap();
+        fs::write(s.0.join("b.txt"), b"two").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+        app.mark_all();
+        assert_eq!(app.marked.len(), 2);
+
+        app.compress("tar");
+        let job = app.job.as_ref().expect("the batch should be running");
+        // A batch has no single input to show, so the Gauge names the archive
+        assert_eq!(job.label, "2_files.tar");
+        drain(&mut app);
+
+        assert!(s.0.join("2_files.tar").is_file(), "the batch produced nothing");
+        assert!(app.marked.is_empty(), "a successful batch clears the marks");
+        assert!(app.last_out.is_some(), "the output info should be shown");
+    }
+
+    #[test]
+    fn a_failed_batch_keeps_its_marks_so_it_can_be_tried_again() {
+        let s = scratch("batch-fail");
+        fs::write(s.0.join("a.txt"), b"one").unwrap();
+        fs::write(s.0.join("b.txt"), b"two").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+        // A member that is not there: tar exits non-zero, which is exactly the
+        // case where throwing the marks away would be worst
+        app.marked = vec![s.0.join("a.txt"), s.0.join("ghost")];
+
+        app.compress("tar");
+        drain(&mut app);
+
+        assert_eq!(app.marked.len(), 2, "a failure must not clear the marks");
+        assert!(app.last_out.is_none(), "a failure shows no output info");
+    }
+
+    #[test]
+    fn a_wim_batch_is_refused_with_copy_that_says_why() {
+        let s = scratch("wim-batch");
+        fs::write(s.0.join("a.txt"), b"one").unwrap();
+        fs::write(s.0.join("b.txt"), b"two").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.refresh_entries();
+        app.mark_all();
+
+        app.compress("wim");
+
+        assert!(app.job.is_none(), "no job may start");
+        assert_eq!(app.status, app.lang.t("status.wim_batch_unsupported"));
+        assert_eq!(app.marked.len(), 2, "a refusal keeps the marks");
+
+        // The refusal is about the count, not about wim: down to one target the very
+        // same key goes out as before. Checked against the command builder
+        // rather than by pressing the key, because that would start a real
+        // capture here and leave `dism` running behind the test
+        app.clear_marks();
+        app.selected = 0;
+        assert_eq!(app.targets().len(), 1, "the selection takes over from the marks");
+        assert!(
+            build_command("wim", std::slice::from_ref(&app.targets()[0])).is_ok(),
+            "a single wim target is exactly what wim is for"
+        );
+    }
+
+    #[test]
+    fn marks_from_two_directories_are_refused() {
+        let s = scratch("mixed-app");
+        fs::create_dir_all(s.0.join("one")).unwrap();
+        fs::create_dir_all(s.0.join("two")).unwrap();
+        fs::write(s.0.join("one/a.txt"), b"a").unwrap();
+        fs::write(s.0.join("two/b.txt"), b"b").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.marked = vec![s.0.join("one/a.txt"), s.0.join("two/b.txt")];
+
+        app.compress("tar");
+
+        assert!(app.job.is_none(), "no job may start");
+        assert_eq!(app.status, app.lang.t("status.marks_mixed_dirs"));
+
+        // One entry on its own never needs the check, so the same key still works
+        app.marked.truncate(1);
+        app.compress("tar");
+        assert!(app.job.is_some(), "a single marked entry must still pack");
+        app.cancel_job();
+    }
+
+    #[test]
+    fn compress_with_nothing_marked_and_nothing_selected_reports_it() {
+        let s = scratch("batch-empty");
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.entries.clear();
+
+        app.compress("tar");
+
+        assert!(app.job.is_none());
+        assert_eq!(app.status, app.lang.t("status.nothing_selected"));
+    }
+
+    #[test]
+    fn a_single_selected_entry_still_packs_under_its_own_name() {
+        // The plain keys are the ones people press without reading the hint row,
+        // so with nothing marked they must behave exactly as they always did
+        let s = scratch("single-target");
+        let file = s.0.join("report.csv");
+        fs::write(&file, b"a,b,c").unwrap();
+
+        let mut app = App::new(Lang::builtin());
+        app.current_dir = s.0.clone();
+        app.entries = vec![file];
+        app.selected = 0;
+
+        app.compress("zst");
+
+        let job = app.job.as_ref().expect("the job should be running");
+        assert_eq!(job.out, s.0.join("report.csv.zst"));
+        assert_eq!(job.label, "report.csv", "the Gauge names the input");
+        drain(&mut app);
+        assert!(s.0.join("report.csv.zst").is_file());
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -7,6 +8,13 @@ use std::{
 use anyhow::Result;
 
 use crate::i18n::Lang;
+
+/// How many names `batch_output_name` is willing to try before giving up.
+///
+/// The probe walks `_2`, `_3`, ... and a directory could in theory already hold
+/// a thousand of them. The cap turns what would be a hang into a definite (if
+/// almost unreachable) answer.
+const BATCH_NAME_LIMIT: usize = 1000;
 
 /// Output file extension per format
 pub(crate) fn output_ext(format: &str) -> &'static str {
@@ -57,6 +65,61 @@ pub(crate) fn output_path(format: &str, path: &Path) -> PathBuf {
     }
 }
 
+/// Whether every path sits directly inside the very same directory.
+///
+/// A batch archive is written next to its members and every tool is handed bare
+/// member names taken from that directory, so entries pulled from two different
+/// places have no single spelling. `App::compress` turns `false` into a
+/// localized refusal; `build_command` re-checks it as an invariant.
+pub(crate) fn same_parent(targets: &[PathBuf]) -> bool {
+    let Some(first) = targets.first().and_then(|p| p.parent()) else {
+        return false;
+    };
+    targets.iter().all(|p| p.parent() == Some(first))
+}
+
+/// Suffix a batch output carries, leading dot excluded.
+///
+/// The stream formats spell out the tar they wrap, so the name says what the
+/// file really is: `3_files.tar.zst`, not a `3_files.zst` that would unpack as
+/// one lone stream.
+fn batch_ext(format: &str) -> &'static str {
+    match format {
+        "tar" => "tar",
+        "zip" => "zip",
+        "7z" => "7z",
+        "zst" => "tar.zst",
+        "gz" => "tar.gz",
+        "xz" => "tar.xz",
+        _ => unreachable!(),
+    }
+}
+
+/// Name for an archive holding `count` marked entries.
+///
+/// A batch has no single input to name itself after, so it is named after its
+/// size. `_2`, `_3`, ... are appended until a free name turns up, which keeps an
+/// existing archive from being overwritten: the first run gets `3_files.zip`,
+/// the next `3_files_2.zip`, and so on.
+pub(crate) fn batch_output_name(count: usize, ext: &str, dir: &Path) -> PathBuf {
+    let stem = format!("{count}_files");
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..=BATCH_NAME_LIMIT {
+        let candidate = dir.join(format!("{stem}_{n}.{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Every index up to the cap is taken, which is absurd on purpose. Stepping
+    // past the cap keeps the function bounded; returning one of the names above
+    // would have the tool overwrite an archive the user still has
+    let past_the_cap = BATCH_NAME_LIMIT + 1;
+    dir.join(format!("{stem}_{past_the_cap}.{ext}"))
+}
+
 /// Success prefix and failure message for a format, localized through `lang`.
 ///
 /// Still a pure lookup: no filesystem, no process, no state. `lang.t` never
@@ -77,18 +140,28 @@ pub(crate) fn format_spec(lang: &Lang, format: &str) -> (String, String) {
 }
 
 /// Assemble the not-yet-started command and output path for a format.
+///
+/// `targets` holds one entry or several. A single entry behaves exactly as it
+/// always did: its own name decides the output and its own kind decides the
+/// tool. Several entries need one archive to live somewhere, so they must all
+/// sit in the same directory; `App::compress` refuses anything else with
+/// localized copy, and the check is repeated here as an invariant so this
+/// function can never quietly pack the first entry and drop the rest.
+///
 /// gz / xz create the output file up front, so a failure to create it is
 /// reported right away instead of turning into a child process that runs and fails
-pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathBuf)> {
-    let out = output_path(format, path);
+pub(crate) fn build_command(format: &str, targets: &[PathBuf]) -> Result<(Command, PathBuf)> {
+    let Some(first) = targets.first() else {
+        anyhow::bail!("compress called without a target");
+    };
+    let batch = targets.len() > 1;
 
-    // None of gzip / xz / zstd accepts a directory: they answer
-    // "is a directory -- ignored" and exit non-zero without writing anything,
-    // which is what made packing a folder with n / m / b silently fail. A tree
-    // has to be tarred first, and `tar -c<flag>f` does the tar and the
-    // compression in one child process, so the job stays a single command and
-    // leaves no intermediate `.tar` to clean up afterwards
-    let dir_stream = is_stream(format) && path.is_dir();
+    // wim captures one directory. Handing it several would write an image of
+    // whichever one dism happened to read first, which reads as success while
+    // silently losing the rest, so refuse instead.
+    if batch && format == "wim" {
+        anyhow::bail!("wim captures a single directory, not {}", targets.len());
+    }
 
     // tar takes its member names from the path it is handed. Given an absolute
     // one it drops the drive letter ("Removing leading drive letter from member
@@ -97,12 +170,50 @@ pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathB
     // parent and naming only the entry keeps the members relative, which is
     // what makes the archive portable. The output path stays absolute, so it is
     // unaffected by the working directory.
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let member = path.file_name().unwrap_or_default();
+    let parent = first.parent().unwrap_or(Path::new("."));
+    if batch && !same_parent(targets) {
+        anyhow::bail!("a batch has to sit in one directory");
+    }
+    let members: Vec<&OsStr> = targets
+        .iter()
+        .map(|p| p.file_name().unwrap_or_default())
+        .collect();
 
-    let mut cmd = if dir_stream {
+    let out = if batch {
+        batch_output_name(targets.len(), batch_ext(format), parent)
+    } else {
+        output_path(format, first)
+    };
+
+    // Which tool writes this archive. tar carries every format except 7z, wim
+    // and a lone stream-compressed file; the last one needs no tar because the
+    // compressor can wrap a single file on its own.
+    //
+    // None of gzip / xz / zstd accepts a directory: they answer "is a directory
+    // -- ignored" and exit non-zero without writing anything, which is what made
+    // packing a folder with n / m / b silently fail. A tree has to be tarred
+    // first, and `tar -c<flag>f` does the tar and the compression in one child
+    // process, so the job stays a single command and leaves no intermediate
+    // `.tar` to clean up afterwards. Several entries need the same treatment.
+    let via_tar = match format {
+        "tar" | "zip" => true,
+        "zst" | "gz" | "xz" => batch || first.is_dir(),
+        _ => false,
+    };
+
+    let mut cmd = if via_tar {
         let mut c = Command::new("tar");
         match format {
+            "tar" => {
+                c.arg("-cf");
+            }
+            // `-a` picks the compressor from the output extension, and both GNU
+            // tar and bsdtar (the tar that ships with Windows) understand it.
+            // Powershell's `Compress-Archive` produced the same zip in a small
+            // fraction of the time, so it is gone
+            "zip" => {
+                c.arg("-a").arg("-cf");
+            }
             "xz" => {
                 c.arg("-cJf");
             }
@@ -115,55 +226,43 @@ pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathB
                 c.arg("-czf");
             }
         }
-        c.current_dir(parent).arg(&out).arg(member);
+        c.current_dir(parent).arg(&out).args(&members);
         c
     } else {
         match format {
-            "tar" => {
-                let mut c = Command::new("tar");
-                c.current_dir(parent).arg("-cf").arg(&out).arg(member);
-                c
-            }
-            "zip" => {
-                let mut c = Command::new("powershell");
-                c.args([
-                    "-Command",
-                    &format!(
-                        "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-                        path.display(),
-                        out.display()
-                    ),
-                ]);
-                c
-            }
             "wim" => {
                 let mut c = Command::new("dism");
                 c.args([
                     "/Capture-Image",
                     &format!("/ImageFile:{}", out.display()),
-                    &format!("/CaptureDir:{}", path.display()),
+                    &format!("/CaptureDir:{}", first.display()),
                     "/Name:archive",
                     "/Compress:max",
                 ]);
                 c
             }
+            // `-y` answers the overwrite question for us, which matters because
+            // the child's stdin is not a terminal
             "7z" => {
                 let mut c = Command::new("7z");
-                c.arg("a").arg(&out).arg(path);
+                c.arg("a").arg("-y").current_dir(parent).arg(&out).args(&members);
                 c
             }
             // A single file: the compressor writes the stream straight out
             "zst" => {
                 let mut c = Command::new("zstd");
-                c.arg("-f").arg("-T0").arg("-o").arg(&out).arg(path);
+                c.arg("-f").arg("-T0").arg("-o").arg(&out).arg(first);
                 c
             }
             "gz" | "xz" => {
                 let mut c = Command::new(if format == "gz" { "gzip" } else { "xz" });
-                c.arg("-k")
-                    .arg("-f")
+                // No `-k`: the stream goes to stdout, which already means the
+                // input is never removed, so "keep" says nothing here. gzip
+                // 1.3.12 (the Scoop build) does not accept the flag at all and
+                // exits 1, which broke every single-file gz pack
+                c.arg("-f")
                     .arg("-c")
-                    .arg(path)
+                    .arg(first)
                     .stdout(Stdio::from(fs::File::create(&out)?));
                 c
             }
@@ -175,7 +274,7 @@ pub(crate) fn build_command(format: &str, path: &Path) -> Result<(Command, PathB
     // file. Everything else discards its output, otherwise the progress chatter
     // from tar / 7z / zstd / dism lands in the TUI and shreds the screen and
     // the progress bar
-    if !(matches!(format, "gz" | "xz") && !dir_stream) {
+    if !(matches!(format, "gz" | "xz") && !via_tar) {
         cmd.stdout(Stdio::null());
     }
     cmd.stderr(Stdio::null());
@@ -211,6 +310,68 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create scratch dir");
         Scratch(dir)
+    }
+
+    /// Two files and one subdirectory, which is the smallest shape that exercises
+    /// "several entries, one of them a tree". The three targets come back in
+    /// marking order.
+    fn batch_fixture(tag: &str) -> (Scratch, Vec<PathBuf>) {
+        let s = scratch(tag);
+        fs::create_dir_all(s.0.join("sub")).unwrap();
+        fs::write(s.0.join("first.txt"), b"one").unwrap();
+        fs::write(s.0.join("second.txt"), b"two").unwrap();
+        fs::write(s.0.join("sub/inner.txt"), b"three").unwrap();
+        let targets = vec![
+            s.0.join("first.txt"),
+            s.0.join("second.txt"),
+            s.0.join("sub"),
+        ];
+        (s, targets)
+    }
+
+    /// Arguments of a command that has not been started yet, as plain strings
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Member names inside `out`, as the tool that reads it back reports them,
+    /// with separators normalized and directory entries trimmed.
+    ///
+    /// tar reads tar, zstd and zip on its own; 7z has an archive only it can
+    /// list. `-slt` is the machine-readable form, where every entry is a
+    /// `Path = <name>` line, the archive itself being the first
+    fn list_members(format: &str, out: &Path) -> Vec<String> {
+        let raw = if format == "7z" {
+            let listing = Command::new("7z")
+                .arg("l")
+                .arg("-slt")
+                .arg(out)
+                .output()
+                .expect("run 7z l");
+            assert!(listing.status.success(), "7z cannot list its own archive");
+            String::from_utf8_lossy(&listing.stdout)
+                .lines()
+                .filter_map(|line| line.strip_prefix("Path = "))
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            let listing = Command::new("tar")
+                .arg("-tf")
+                .arg(out)
+                .output()
+                .expect("run tar -tf");
+            assert!(listing.status.success(), "tar cannot list the {format} archive");
+            String::from_utf8_lossy(&listing.stdout).into_owned()
+        };
+
+        raw.lines()
+            .map(|name| name.trim().replace('\\', "/"))
+            .map(|name| name.trim_end_matches('/').to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
     }
 
     #[test]
@@ -249,7 +410,7 @@ mod tests {
 
         for (format, ext) in [("gz", "gz"), ("xz", "xz"), ("zst", "zst")] {
             let target = dir.0.join("tree");
-            let (mut cmd, out) = build_command(format, &target).expect("build");
+            let (mut cmd, out) = build_command(format, &[target]).expect("build");
 
             assert_eq!(cmd.get_program(), "tar", "{format}");
             assert_eq!(out, dir.0.join(format!("tree.tar.{ext}")), "{format}");
@@ -299,7 +460,7 @@ mod tests {
         fs::write(&file, b"a,b,c").unwrap();
 
         assert_eq!(output_path("zst", &file), dir.0.join("report.csv.zst"));
-        let (cmd, _) = build_command("zst", &file).expect("build");
+        let (cmd, _) = build_command("zst", std::slice::from_ref(&file)).expect("build");
         assert_eq!(cmd.get_program(), "zstd", "a file needs no tar");
     }
 
@@ -312,11 +473,14 @@ mod tests {
         fs::create_dir_all(&tree).unwrap();
 
         assert_eq!(output_path("tar", &tree), dir.0.join("tree.tar"));
-        let (cmd, _) = build_command("tar", &tree).expect("build");
+        let (cmd, _) = build_command("tar", std::slice::from_ref(&tree)).expect("build");
         assert_eq!(cmd.get_program(), "tar");
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(args.contains(&"-cf".to_string()), "{args:?}");
         assert!(!args.iter().any(|a| a == "--zstd"), "{args:?}");
+        // A single directory is a one-member archive, not a batch: the output is
+        // named after the tree rather than after a count
+        assert!(!args.iter().any(|a| a.contains("_files")), "{args:?}");
     }
 
     #[test]
@@ -349,6 +513,307 @@ mod tests {
         assert_eq!(
             output_path("zst", Path::new(r"D:\work\.gitignore")),
             Path::new(r"D:\work\.gitignore.zst")
+        );
+    }
+
+    // ---- batch naming ----
+    #[test]
+    fn a_batch_takes_the_free_name_and_then_counts_up() {
+        let s = scratch("batch-name");
+        let dir = &s.0;
+
+        // Nothing in the way: the plain name, with no index at all
+        assert_eq!(batch_output_name(3, "zip", dir), dir.join("3_files.zip"));
+
+        // One taken: the index starts at 2, not at 1, so the first run's name is
+        // never a special case nobody guesses
+        fs::write(dir.join("3_files.zip"), b"x").unwrap();
+        assert_eq!(batch_output_name(3, "zip", dir), dir.join("3_files_2.zip"));
+
+        // Two taken: the probe keeps going rather than overwriting either
+        fs::write(dir.join("3_files_2.zip"), b"x").unwrap();
+        assert_eq!(batch_output_name(3, "zip", dir), dir.join("3_files_3.zip"));
+
+        // The count is part of the name, so batches of different sizes never
+        // collide with one another
+        assert_eq!(batch_output_name(5, "zip", dir), dir.join("5_files.zip"));
+    }
+
+    #[test]
+    fn a_batch_name_says_what_it_really_is() {
+        let dir = Path::new(r"D:\work");
+        // The stream formats wrap a tar, and the name has to admit it: a
+        // `3_files.zst` would unpack as one lone stream rather than a tree
+        assert_eq!(batch_output_name(3, "tar.zst", dir), Path::new(r"D:\work\3_files.tar.zst"));
+        assert_eq!(batch_output_name(3, "tar.gz", dir), Path::new(r"D:\work\3_files.tar.gz"));
+        assert_eq!(batch_output_name(3, "tar.xz", dir), Path::new(r"D:\work\3_files.tar.xz"));
+        assert_eq!(batch_output_name(3, "tar", dir), Path::new(r"D:\work\3_files.tar"));
+        assert_eq!(batch_output_name(3, "7z", dir), Path::new(r"D:\work\3_files.7z"));
+    }
+
+    #[test]
+    fn a_batch_name_probe_gives_up_instead_of_spinning() {
+        // Every candidate from the plain name up to the cap is taken, which is
+        // absurd on purpose: the function still has to come back with something
+        let s = scratch("batch-full");
+        let dir = &s.0;
+        fs::write(dir.join("3_files.zip"), b"x").unwrap();
+        for n in 2..=BATCH_NAME_LIMIT {
+            fs::write(dir.join(format!("3_files_{n}.zip")), b"x").unwrap();
+        }
+        // Every index up to the cap is taken, so the probe has to stop and the
+        // answer lands one past the cap rather than on a name that exists
+        let past_the_cap = BATCH_NAME_LIMIT + 1;
+        assert_eq!(
+            batch_output_name(3, "zip", dir),
+            dir.join(format!("3_files_{past_the_cap}.zip"))
+        );
+    }
+
+    // ---- batch arguments ----
+    #[test]
+    fn a_batch_of_tar_formats_names_its_members_relative_to_the_parent() {
+        // `-a` rather than `--format zip`: both GNU tar and bsdtar understand it,
+        // and `Compress-Archive` took orders of magnitude longer for the same zip
+        for (format, flags) in [
+            ("tar", vec!["-cf"]),
+            ("zst", vec!["--zstd", "-cf"]),
+            ("gz", vec!["-czf"]),
+            ("xz", vec!["-cJf"]),
+            ("zip", vec!["-a", "-cf"]),
+        ] {
+            let (s, targets) = batch_fixture(format);
+            let (cmd, out) = build_command(format, &targets).expect("build");
+
+            assert_eq!(cmd.get_program(), "tar", "{format}");
+            // Running from the parent is what keeps the members relative: given an
+            // absolute name tar drops the drive letter and records the members as
+            // `/Users/name/...`, which rebuilds that whole chain when unpacked
+            assert_eq!(cmd.get_current_dir(), Some(s.0.as_path()), "{format}");
+            assert_eq!(out, s.0.join(format!("3_files.{}", batch_ext(format))), "{format}");
+
+            let args = args_of(&cmd);
+            assert_eq!(&args[..flags.len()], flags, "{format}");
+            assert_eq!(args[flags.len()], out.display().to_string(), "{format}");
+            // Bare names, in exactly the order the user marked them
+            assert_eq!(
+                &args[flags.len() + 1..],
+                ["first.txt", "second.txt", "sub"],
+                "{format} must pass bare member names"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_of_7z_passes_bare_names_too() {
+        let (s, targets) = batch_fixture("7z-batch");
+        let (cmd, out) = build_command("7z", &targets).expect("build");
+
+        assert_eq!(cmd.get_program(), "7z");
+        assert_eq!(cmd.get_current_dir(), Some(s.0.as_path()));
+        assert_eq!(out, s.0.join("3_files.7z"));
+        // `-y` answers the overwrite question, which matters because the child's
+        // stdin is not a terminal
+        assert_eq!(
+            args_of(&cmd),
+            [
+                "a".to_string(),
+                "-y".to_string(),
+                out.display().to_string(),
+                "first.txt".to_string(),
+                "second.txt".to_string(),
+                "sub".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_zip_target_goes_through_tar_as_well() {
+        // The switch away from Powershell applies to a lone file too: `x` on one
+        // target is the most common zip there is
+        let (s, mut targets) = batch_fixture("zip-one");
+        targets.truncate(1);
+        let (cmd, out) = build_command("zip", &targets).expect("build");
+
+        assert_eq!(cmd.get_program(), "tar");
+        assert_eq!(
+            args_of(&cmd),
+            [
+                "-a".to_string(),
+                "-cf".to_string(),
+                out.display().to_string(),
+                "first.txt".to_string(),
+            ]
+        );
+        // A single target keeps its own naming: no count, no index
+        assert_eq!(out, s.0.join("first.zip"));
+    }
+
+    #[test]
+    fn a_batch_refuses_the_formats_that_cannot_take_several_entries() {
+        let (_s, targets) = batch_fixture("wim-batch");
+        // dism names one capture dir; handing it several would image whichever
+        // one it read first and report success while dropping the rest
+        let err = build_command("wim", &targets).expect_err("wim must refuse a batch");
+        assert!(!err.to_string().is_empty());
+
+        // A single directory is still perfectly fine
+        let (s, mut one) = batch_fixture("wim-one");
+        one.truncate(1);
+        let (cmd, out) = build_command("wim", &one).expect("build");
+        assert_eq!(cmd.get_program(), "dism");
+        assert_eq!(out, s.0.join("first.wim"));
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a.starts_with("/CaptureDir:")), "{args:?}");
+    }
+
+    #[test]
+    fn entries_from_two_directories_cannot_share_one_archive() {
+        let s = scratch("mixed-dirs");
+        fs::create_dir_all(s.0.join("one")).unwrap();
+        fs::create_dir_all(s.0.join("two")).unwrap();
+        let a = s.0.join("one/a.txt");
+        let b = s.0.join("two/b.txt");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+
+        assert!(!same_parent(&[a.clone(), b.clone()]));
+        assert!(
+            build_command("tar", &[a.clone(), b.clone()]).is_err(),
+            "two directories have no common spelling for their members"
+        );
+
+        // One entry never needs the check, and same-directory entries pass it
+        assert!(same_parent(std::slice::from_ref(&a)));
+        assert!(build_command("tar", std::slice::from_ref(&a)).is_ok());
+        let c = s.0.join("one/c.txt");
+        assert!(same_parent(&[a.clone(), c.clone()]));
+    }
+
+    #[test]
+    fn a_batch_with_no_targets_is_refused_rather_than_panicking() {
+        assert!(build_command("tar", &[]).is_err());
+        assert!(build_command("zip", &[]).is_err());
+    }
+
+    // ---- real tools ----
+    #[test]
+    fn a_real_batch_archive_holds_every_member_under_a_relative_name() {
+        // The bug this guards: handing tar the absolute paths made it print
+        // "Removing leading drive letter from member names" and store the members
+        // as `/Users/name/...`, so unpacking rebuilt the entire chain from the
+        // drive root. Only running the real tools catches that, because the
+        // argument list looks fine either way
+        for (format, ext) in [
+            ("tar", "tar"),
+            ("zst", "tar.zst"),
+            ("zip", "zip"),
+            ("7z", "7z"),
+        ] {
+            let (s, targets) = batch_fixture(format);
+            let (mut cmd, out) = build_command(format, &targets).expect("build");
+            assert_eq!(out, s.0.join(format!("3_files.{ext}")), "{format}");
+
+            let status = cmd.status().unwrap_or_else(|e| panic!("run {format}: {e}"));
+            assert!(status.success(), "{format} failed: {status}");
+            assert!(out.is_file(), "{format} produced nothing");
+
+            let members = list_members(format, &out);
+            assert!(members.contains(&"first.txt".to_string()), "{format}: {members:?}");
+            assert!(members.contains(&"second.txt".to_string()), "{format}: {members:?}");
+            // The directory came along whole, not as an empty placeholder
+            assert!(
+                members.iter().any(|m| m == "sub" || m.starts_with("sub/")),
+                "{format} dropped the tree: {members:?}"
+            );
+            for name in &members {
+                assert!(!name.contains(':'), "{format} stored a drive letter: {name}");
+                assert!(!name.contains("Users"), "{format} stored an absolute path: {name}");
+                assert!(!name.starts_with('/'), "{format} stored an absolute path: {name}");
+                assert!(
+                    !name.contains(&s.0.display().to_string().replace('\\', "/")),
+                    "{format} stored the whole path: {name}"
+                );
+            }
+
+            // `tar -a -cf` has to produce a zip other tools can open, not a tar
+            // wearing a `.zip` name
+            if format == "zip" {
+                let head = fs::read(&out).expect("read the zip back");
+                assert_eq!(&head[..4], &[0x50, 0x4B, 0x03, 0x04], "not a zip archive");
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_file_stream_really_writes_into_the_output_file() {
+        // gz / xz stream to stdout, so the only thing keeping the archive is the
+        // redirect into the output file. Point stdout at /dev/null instead and the
+        // file comes out empty while the job still reports success.
+        //
+        // Both compressors are exercised with the real binary. gzip used to be
+        // skipped here because it was invoked with `-k`, which gzip 1.3.12
+        // rejects outright: that turned a genuine bug (every single-file gz
+        // pack failing) into an excuse to test something else instead
+        let s = scratch("stream-stdout");
+        let payload = b"a,b,c,a,b,c,a,b,c";
+
+        for (format, program, ext) in [("gz", "gzip", "gz"), ("xz", "xz", "xz")] {
+            // The same input for both: appending the suffix has to give
+            // `report.csv.gz` / `report.csv.xz`, never `report.gz`
+            let file = s.0.join("report.csv");
+            fs::write(&file, payload).unwrap();
+
+            let (mut cmd, out) = build_command(format, std::slice::from_ref(&file)).expect("build");
+            assert_eq!(cmd.get_program(), program, "wrong compressor for {format}");
+            // `-k` would be rejected by older gzip builds and is meaningless
+            // here: the stream goes to stdout, so the input is never at risk
+            assert!(
+                !cmd.get_args().any(|a| a == "-k"),
+                "{format} must not pass -k: {}",
+                cmd.get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+
+            let status = cmd.status().expect("run compressor");
+            assert!(status.success(), "{format} failed: {status}");
+            assert_eq!(out, s.0.join(format!("report.csv.{ext}")));
+            assert!(
+                fs::metadata(&out).expect("stat output").len() > 0,
+                "{format}: the stream never reached the output file"
+            );
+            // The input has to survive: the round trip hands it back unchanged
+            assert_eq!(fs::read(&file).unwrap(), payload, "{format} touched the input");
+        }
+    }
+
+    #[test]
+    fn a_second_batch_never_overwrites_the_first() {
+        // Run the same batch twice and both archives have to survive: the probe is
+        // what keeps `3_files.tar` from being clobbered by `3_files_2.tar`
+        let (s, targets) = batch_fixture("batch-twice");
+        let (mut first_cmd, first) = build_command("tar", &targets).expect("build");
+        let status = first_cmd.status().expect("run tar");
+        assert!(status.success(), "the first batch failed: {status}");
+
+        let (_second_cmd, second) = build_command("tar", &targets).expect("build");
+
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap(), "3_files.tar");
+        assert_eq!(second.file_name().unwrap(), "3_files_2.tar");
+        assert_eq!(first.parent(), second.parent());
+        // Both land beside the entries they were built from
+        assert_eq!(first.parent(), Some(s.0.as_path()));
+        // The first archive is still there, holding exactly what it held before
+        assert!(first.is_file());
+        let members = list_members("tar", &first);
+        assert!(
+            members.contains(&"first.txt".to_string())
+                && members.contains(&"second.txt".to_string())
+                && members.contains(&"sub/inner.txt".to_string()),
+            "the first batch changed: {members:?}"
         );
     }
 }

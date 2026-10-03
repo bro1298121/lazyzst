@@ -115,6 +115,13 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                         app.selected = app.entries.len().saturating_sub(1);
                         app.scroll_offset = app.selected.saturating_sub(VISIBLE_ROWS - 1);
                     }
+                    // Marks are how a batch is built up: Space adds or removes
+                    // one, A takes everything in this directory, u drops just the
+                    // entry under the cursor and U drops all of them
+                    KeyCode::Char(' ') => app.toggle_mark(),
+                    KeyCode::Char('A') => app.mark_all(),
+                    KeyCode::Char('u') => app.unmark_selected(),
+                    KeyCode::Char('U') => app.clear_marks(),
                     _ => {}
                 }
             }

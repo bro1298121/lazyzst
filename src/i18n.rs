@@ -53,6 +53,33 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
         "Compressing: {0} {1} ({2}s)",
     ),
     ("status.size_field", "大小:", "大小:", "Size:"),
+    // ---- marks ----
+    // The count and the breakdown are separate keys so the corner counter can
+    // drop the breakdown when its row is too narrow for it
+    ("status.marked_count", "已标记 {0} 项", "已標記 {0} 項", "Marked {0}"),
+    (
+        "status.marked_files_dirs",
+        "（{0} 文件 · {1} 文件夹）",
+        "（{0} 檔案 · {1} 資料夾）",
+        " ({0} files · {1} folders)",
+    ),
+    ("status.unmarked", "已取消标记（剩余 {0} 项）", "已取消標記（剩餘 {0} 項）", "Unmarked ({0} left)"),
+    ("status.not_marked", "选中项没有标记", "選中項沒有標記", "The selected entry is not marked"),
+    ("status.nothing_marked", "没有标记", "沒有標記", "Nothing marked"),
+    ("status.marks_cleared", "已清空 {0} 项标记", "已清空 {0} 項標記", "Cleared {0} marks"),
+    ("status.already_marked", "所有条目都已标记", "所有項目都已標記", "Every entry is already marked"),
+    (
+        "status.wim_batch_unsupported",
+        "wim 只能压缩单个目录，批量压缩已中止",
+        "wim 只能壓縮單個目錄，批量壓縮已中止",
+        "wim compresses a single directory; the batch was refused",
+    ),
+    (
+        "status.marks_mixed_dirs",
+        "标记的条目必须都在同一个目录里",
+        "標記的項目必須都在同一個目錄裡",
+        "Marked entries must all be in the same directory",
+    ),
     ("status.deleted", "已删除{0}: {1}", "已刪除{0}: {1}", "Deleted {0}: {1}"),
     ("status.delete_failed", "删除失败", "刪除失敗", "Delete failed"),
     (
@@ -110,6 +137,8 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("key.quit", "退出", "離開", "Quit"),
     ("key.back", "返回", "返回", "Up"),
     ("key.extract", "解压", "解壓", "Extract"),
+    ("key.mark", "标记", "標記", "Mark"),
+    ("key.mark_all", "全选", "全選", "All"),
     // ---- delete confirmation dialog ----
     ("dialog.title", "删除确认", "刪除確認", "Confirm Delete"),
     (

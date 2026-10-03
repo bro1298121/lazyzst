@@ -775,7 +775,8 @@ mod tests {
         fs::write(tree.join("inner/leaf.txt"), b"payload").unwrap();
 
         // `build_command` hands back a command that has not been started yet
-        let (mut pack, packed) = crate::compress::build_command("zst", &tree).expect("build pack");
+        let (mut pack, packed) =
+            crate::compress::build_command("zst", std::slice::from_ref(&tree)).expect("build pack");
         assert_eq!(packed, s.0.join("tree.tar.zst"));
         let packed_status = pack.status().expect("run tar");
         assert!(packed_status.success(), "packing failed: {packed_status}");
