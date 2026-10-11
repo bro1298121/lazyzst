@@ -29,13 +29,17 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // Top: current path
+    // Top: current path. In the "This PC" view `current_dir` is the internal
+    // sentinel, so the panel says the view's own name instead of a path that
+    // does not exist
+    let path_label = if app.at_drives {
+        lang.t("panel.this_pc")
+    } else {
+        app.current_dir.display().to_string()
+    };
     let path_text = Paragraph::new(Line::from(vec![
         Span::styled("📁 ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            app.current_dir.display().to_string(),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(path_label, Style::default().fg(Color::White)),
     ]))
     .block(Block::default().borders(Borders::ALL).title(lang.t("panel.path")))
     .style(Style::default().fg(Color::White));
@@ -59,7 +63,12 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         .skip(app.scroll_offset)
         .take(VISIBLE_ROWS)
         .map(|(i, path)| {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            // A drive root has no file name, so the row falls back to the path
+            // itself (`D:\`) rather than printing an empty name
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
             // The glyph says what the entry is: a Nerd Font one per file type,
             // or the plain emoji when the terminal has no Nerd Font. The colour
             // asks the kind alone, so it keeps its cyan folders either way
@@ -135,7 +144,9 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
             Line::from(vec![
                 label("info.name"),
                 Span::styled(
-                    path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string()),
                     Style::default().fg(Color::White),
                 ),
             ]),
@@ -708,6 +719,15 @@ pub(crate) fn size_of(path: &Path, lang: &Lang) -> String {
 /// `size_of` with an explicit walk budget. Splitting it out is what lets the
 /// tests drive the truncated path without building a tree of 50 000 files.
 fn size_of_budgeted(path: &Path, budget: usize, lang: &Lang) -> String {
+    // A filesystem root is never measured. Walking one stops at the budget and
+    // reports a floor, which on a mounted volume reads as a nearly-empty disk:
+    // "2.82 GB+" on a volume holding 336 GB is not a rough figure, it is a lie.
+    // There is no meaningful total to show, so show nothing instead of a number
+    // the user cannot act on
+    if crate::app::is_fs_root(path) {
+        return lang.t("value.size_not_applicable");
+    }
+
     match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => {
             let (total, complete) = directory_size(path, budget);
@@ -1571,6 +1591,42 @@ mod tests {
     }
 
     #[test]
+    fn a_filesystem_root_reports_no_size_at_all() {
+        // A walk of a volume stops at the budget and reports a floor, which on
+        // a mounted disk reads as a nearly-empty one. Better to show nothing
+        let lang = Lang::builtin();
+        let not_applicable = lang.t("value.size_not_applicable");
+
+        #[cfg(windows)]
+        for root in [r"D:\", "D:", r"\\server\share"] {
+            assert_eq!(
+                size_of_budgeted(Path::new(root), 5_000, &lang),
+                not_applicable,
+                "{root} must not be measured"
+            );
+        }
+
+        // Real drives on this machine, too: whatever the budget, no walk
+        for drive in crate::app::available_drives() {
+            assert_eq!(
+                size_of_budgeted(&drive, 5_000, &lang),
+                not_applicable,
+                "{drive:?} must not be measured"
+            );
+        }
+
+        // An ordinary directory is still measured: the root guard must not
+        // swallow every path that happens to have no parent spelled out
+        let dir = scratch("size-root-guard");
+        fs::write(dir.0.join("payload.bin"), vec![0u8; 2048]).unwrap();
+        assert_eq!(
+            size_of_budgeted(&dir.0, 5_000, &lang),
+            "2.00 KB",
+            "a normal directory still gets a real total"
+        );
+    }
+
+    #[test]
     fn degenerate_paths_do_not_panic() {
         // Trailing separator / no file name / bare root / empty path
         for p in [r"D:\", "/", "", r"\\", r"C:", r"D:\.hidden", r"D:\..", r"D:\a."] {
@@ -1586,5 +1642,35 @@ mod tests {
         let p = Path::new("/usr/local/share/documents/report.7z");
         let out = elide_path(p, 24);
         assert_eq!(out, "/...report.7z");
+    }
+
+    #[test]
+    fn the_this_pc_view_names_itself_and_hides_the_sentinel() {
+        for tag in LANGS {
+            let lang = lang(tag);
+            let mut app = App::new(lang.clone(), false);
+            app.at_drives = true;
+            app.current_dir = PathBuf::from("::drives::");
+            // Fake roots: nothing here reads a real drive, and a nonexistent
+            // drive makes `size_of` answer "unknown" without walking anything
+            app.entries = vec![PathBuf::from(r"Z:\"), PathBuf::from(r"Y:\")];
+            app.selected = 0;
+            app.scroll_offset = 0;
+
+            let screen = render(&mut app, 80, 24);
+
+            assert!(
+                screen.contains(&lang.t("panel.this_pc")),
+                "{tag}: the path panel should name the view: {screen}"
+            );
+            assert!(
+                !screen.contains("::drives::"),
+                "{tag}: the sentinel must never leak into the UI: {screen}"
+            );
+            assert!(
+                screen.contains(r"Z:\"),
+                "{tag}: a drive root should be listed: {screen}"
+            );
+        }
     }
 }

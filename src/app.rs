@@ -23,6 +23,13 @@ pub(crate) const TICK: Duration = Duration::from_millis(100);
 /// Animation step; wraps around once it passes 100
 pub(crate) const PROGRESS_STEP: u16 = 3;
 
+/// `current_dir` while the virtual "This PC" drive list is shown.
+///
+/// A sentinel and not a real directory: it keeps the state machine from having
+/// to carry an `Option`, and no real path can ever equal it, so it can never
+/// accidentally point at something the user can reach
+pub(crate) const DRIVES_SENTINEL: &str = "::drives::";
+
 /// What a running job is doing, so the completion copy and the Gauge label can
 /// branch without the compression path having to know about extraction.
 ///
@@ -143,6 +150,10 @@ pub(crate) struct App {
     pub(crate) selected: usize,
     pub(crate) scroll_offset: usize,
     pub(crate) status: String,
+    /// Whether the virtual "This PC" drive list is being shown instead of a real
+    /// directory. While set, `entries` holds drive roots and `current_dir` is
+    /// [`DRIVES_SENTINEL`]
+    pub(crate) at_drives: bool,
     pub(crate) job: Option<JobState>,
     /// When set, the status bar shows "output + size" and elides the path to
     /// the terminal width
@@ -181,6 +192,7 @@ impl App {
             entries,
             selected: 0,
             scroll_offset: 0,
+            at_drives: false,
             job: None,
             last_out: None,
             dialog: None,
@@ -213,15 +225,39 @@ impl App {
     /// just compressed, extracted or deleted would otherwise keep reporting the
     /// size it had before the change
     fn refresh_entries(&mut self) {
+        // The drive list is not a directory: re-reading the sentinel would wipe
+        // the view out. Any caller that wants the listing back does so after
+        // leaving the "This PC" view, so staying here must not refresh
+        if self.at_drives {
+            self.size_cache = None;
+            return;
+        }
         self.entries = Self::read_dir(&self.current_dir);
         self.size_cache = None;
     }
 
     pub(crate) fn enter_dir(&mut self) {
-        let entry = self.entries.get(self.selected).cloned();
-        if let Some(entry) = entry
-            && entry.is_dir()
-        {
+        let Some(entry) = self.entries.get(self.selected).cloned() else {
+            return;
+        };
+
+        // In the "This PC" view every row is a drive root, so entering one means
+        // leaving the view for the drive; the drive list was built from real
+        // directories, so no `is_dir` guard is needed here
+        if self.at_drives {
+            self.current_dir = entry.clone();
+            self.at_drives = false;
+            self.refresh_entries();
+            self.selected = 0;
+            self.scroll_offset = 0;
+            // Different directory: the previous output is no longer relevant
+            self.last_out = None;
+            self.status =
+                self.lang.tf("status.entered_drive", &[&entry.display().to_string()]);
+            return;
+        }
+
+        if entry.is_dir() {
             let path = entry.clone();
             self.current_dir = path;
             self.refresh_entries();
@@ -234,16 +270,54 @@ impl App {
     }
 
     pub(crate) fn go_up(&mut self) {
-        let parent = self.current_dir.parent().map(|p| p.to_path_buf());
-        if let Some(parent) = parent {
-            self.current_dir = parent.clone();
-            self.refresh_entries();
-            self.selected = 0;
-            self.scroll_offset = 0;
-            // Different directory: the previous output is no longer relevant
-            self.last_out = None;
-            self.status = format!("{} {}", self.lang.t("status.entered"), parent.display());
+        // The drive list is the top: there is nothing above it. Backspace is
+        // swallowed rather than quitting — `q` is the way out
+        if self.at_drives {
+            return;
         }
+
+        match self.current_dir.parent() {
+            Some(parent) => {
+                let parent = parent.to_path_buf();
+                self.current_dir = parent.clone();
+                self.refresh_entries();
+                self.selected = 0;
+                self.scroll_offset = 0;
+                // Different directory: the previous output is no longer relevant
+                self.last_out = None;
+                self.status =
+                    format!("{} {}", self.lang.t("status.entered"), parent.display());
+            }
+            // A filesystem root has no parent: open the drive list instead of
+            // getting stuck on the root. Nothing happens when there are no
+            // drives, so the user is never dropped into an empty screen
+            None => self.enter_drives_view(),
+        }
+    }
+
+    /// Open the virtual "This PC" listing over the enumeration of every drive
+    /// root. The entries are set directly and `current_dir` becomes the
+    /// sentinel, so nothing is ever read from a path that does not exist
+    fn enter_drives_view(&mut self) {
+        self.enter_drives_view_with(available_drives());
+    }
+
+    /// `enter_drives_view` with the drive list spelled out, so the empty case
+    /// can be exercised without a real enumeration behind it
+    fn enter_drives_view_with(&mut self, drives: Vec<PathBuf>) {
+        if drives.is_empty() {
+            // Stay exactly where we are: an empty view has nothing to select
+            // and would be a dead end with no way back
+            return;
+        }
+        self.entries = drives;
+        self.current_dir = PathBuf::from(DRIVES_SENTINEL);
+        self.at_drives = true;
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.last_out = None;
+        self.status =
+            format!("{} {}", self.lang.t("status.entered"), self.lang.t("panel.this_pc"));
     }
 
     pub(crate) fn get_selected_path(&self) -> Option<PathBuf> {
@@ -367,6 +441,13 @@ impl App {
             return;
         };
 
+        // A drive root is never a deletable entry: `remove_dir_all("D:\\")`
+        // would erase the whole volume. Refuse without even opening the dialog
+        if is_fs_root(&path) {
+            self.status = self.lang.t("status.delete_drive_refused");
+            return;
+        }
+
         // The kind is decided once, here: both the wording and the removal use
         // it, so nothing can drift halfway through the dialog
         self.dialog = Some(Dialog {
@@ -445,6 +526,13 @@ impl App {
             return;
         }
 
+        // A drive root cannot be a compression source: packing a whole volume
+        // would run until the disk runs dry and the archive would be useless
+        if targets.iter().any(|t| is_fs_root(t)) {
+            self.status = self.lang.t("status.compress_drive_refused");
+            return;
+        }
+
         // wim captures one directory. Its `dism` invocation names a single
         // capture dir, so a batch would write an image of whichever entry it
         // read first and report success while losing the rest
@@ -519,6 +607,13 @@ impl App {
             self.status = self.lang.t("status.nothing_selected");
             return;
         };
+
+        // A drive root holds no magic number and unpacking into one would
+        // scatter files over an entire volume: refuse it by name
+        if is_fs_root(&path) {
+            self.status = self.lang.t("status.extract_drive_refused");
+            return;
+        }
 
         // `detect` reports why it gave up, so there is nothing to add here
         let Some(format) = self.detect(&path) else {
@@ -762,6 +857,40 @@ impl App {
     }
 }
 
+/// Every drive root on the machine, in `A:\`..`Z:\` order with no duplicates.
+///
+/// Windows has no single directory that spans the volumes, so each letter is
+/// probed on its own and only the roots `is_dir()` confirms are kept: an empty
+/// card-reader slot that exists as a device but cannot be read does not show
+/// up. Other platforms have no concept of a drive letter and get an empty list
+/// rather than a panic, which also keeps the "This PC" view unreachable there
+pub(crate) fn available_drives() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut drives: Vec<PathBuf> = (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|root| root.is_dir())
+            .collect();
+        drives.sort();
+        drives.dedup();
+        drives
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Whether `path` names a filesystem root: a drive root like `D:\`, a bare
+/// drive like `D:`, or a UNC share root like `\\server\share`.
+///
+/// `Path::parent()` returns `None` exactly when there is nothing above the
+/// path, which all of those share. Deleting such a path would take the whole
+/// volume with it, so every destructive path checks this before acting
+pub(crate) fn is_fs_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
 /// Delete by the kind that was locked in when the dialog opened.
 ///
 /// Deletion is irreversible, so the kind is **not re-derived** here and `is_dir`
@@ -775,6 +904,14 @@ impl App {
 /// `lang` is only used to word that error, which reaches the user through the
 /// status bar.
 pub(crate) fn remove_path(lang: &Lang, path: &Path, is_dir: bool) -> anyhow::Result<()> {
+    // Last line of defence against wiping a whole volume: a filesystem root is
+    // never a deletable entry, whatever the caller or the selection said. This
+    // sits above the kind re-check so no path with no parent can ever reach
+    // `remove_dir_all` / `remove_file`
+    if is_fs_root(path) {
+        anyhow::bail!("{}", lang.t("status.delete_drive_refused"));
+    }
+
     // An already-missing path is not a kind change: let the removal below report
     // the real "no such file" error
     if path.exists() && path.is_dir() != is_dir {
@@ -1570,5 +1707,214 @@ mod tests {
         assert_eq!(job.label, "report.csv", "the Gauge names the input");
         drain(&mut app);
         assert!(s.0.join("report.csv.zst").is_file());
+    }
+
+    // ---- "This PC" drive view ----
+
+    #[test]
+    fn go_up_at_a_drive_root_opens_the_this_pc_view() {
+        let Some(root) = available_drives().first().cloned() else {
+            return; // no drive letters to test against (non-Windows)
+        };
+        assert!(root.parent().is_none(), "{root:?} must be a root");
+
+        let mut app = App::new(Lang::builtin(), false);
+        app.current_dir = root.clone();
+
+        app.go_up();
+
+        // Backspace at a drive root opens the drive list instead of doing nothing
+        assert!(app.at_drives, "the drive list should open");
+        assert_eq!(app.current_dir, PathBuf::from(DRIVES_SENTINEL));
+        assert_eq!(app.entries, available_drives(), "the entries are the drives");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.last_out.is_none(), "stale output info must be cleared");
+    }
+
+    #[test]
+    fn go_up_inside_the_this_pc_view_does_nothing() {
+        let Some(root) = available_drives().first().cloned() else {
+            return; // no drive letters to test against (non-Windows)
+        };
+        let mut app = App::new(Lang::builtin(), false);
+        app.current_dir = root.clone();
+        app.go_up();
+        assert!(app.at_drives);
+
+        let before = (app.entries.clone(), app.current_dir.clone(), app.selected);
+        app.go_up();
+
+        // Still in the view: Backspace must not quit, move or blank the list
+        assert!(app.at_drives, "the drive list stays open");
+        assert_eq!(
+            (app.entries, app.current_dir, app.selected),
+            before,
+            "a second Backspace must be a no-op"
+        );
+    }
+
+    #[test]
+    fn go_up_from_a_subdirectory_does_not_open_the_this_pc_view() {
+        let s = scratch("go-up-sub");
+        let sub = s.0.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let mut app = App::new(Lang::builtin(), false);
+        app.current_dir = sub.clone();
+        app.refresh_entries();
+
+        app.go_up();
+
+        assert!(!app.at_drives, "a subdirectory still climbs the tree");
+        assert_eq!(app.current_dir, s.0, "the parent is where it always went");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn enter_dir_from_the_this_pc_view_enters_the_selected_drive() {
+        let mut app = App::new(Lang::builtin(), false);
+        // Fake roots: nothing here opens a real drive listing
+        app.enter_drives_view_with(vec![PathBuf::from(r"Z:\"), PathBuf::from(r"Y:\")]);
+        assert!(app.at_drives);
+        app.selected = 1;
+        app.scroll_offset = 5;
+        app.last_out = Some(OutputInfo {
+            prefix: app.lang.t("compress.zst.ok"),
+            path: PathBuf::from("old.zst"),
+            size: "1 KB".to_string(),
+        });
+
+        app.enter_dir();
+
+        assert!(!app.at_drives, "entering a drive leaves the view");
+        assert_eq!(app.current_dir, PathBuf::from(r"Y:\"));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.last_out.is_none(), "stale output info must be cleared");
+        assert_eq!(
+            app.status,
+            app.lang.tf("status.entered_drive", &[r"Y:\"]),
+            "status={}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn remove_path_refuses_a_filesystem_root_and_leaves_it_intact() {
+        let lang = Lang::builtin();
+        let refusal = lang.t("status.delete_drive_refused");
+
+        // Every spelling of a root must hit the guard, which fires before any
+        // I/O: none of these paths is ever deleted
+        #[cfg(windows)]
+        for root in [Path::new(r"D:\"), Path::new("D:"), Path::new(r"\\server\share")] {
+            let err = remove_path(&lang, root, true).expect_err("a root must be refused");
+            assert!(
+                err.to_string().contains(&refusal),
+                "{root:?} gave an unexpected error: {err}"
+            );
+        }
+
+        // The core safety assertion: after the refusal a real drive root still
+        // exists, because the guard stopped the deletion before it began
+        for drive in available_drives() {
+            let err = remove_path(&lang, &drive, true).expect_err("a drive must be refused");
+            assert!(err.to_string().contains(&refusal), "{err}");
+            assert!(
+                drive.exists(),
+                "the guard must never delete a drive root: {drive:?}"
+            );
+        }
+
+        // The judgement itself, spelled out
+        #[cfg(windows)]
+        {
+            assert!(is_fs_root(Path::new(r"D:\")));
+            assert!(is_fs_root(Path::new("D:")));
+            assert!(is_fs_root(Path::new(r"\\server\share")));
+            assert!(is_fs_root(Path::new(r"\\server\share\")));
+        }
+        assert!(!is_fs_root(&std::env::temp_dir().join("lazyzst-not-a-root")));
+    }
+
+    #[test]
+    fn request_delete_refuses_a_drive_root_without_opening_the_dialog() {
+        let Some(root) = available_drives().first().cloned() else {
+            return; // no drive letters to test against (non-Windows)
+        };
+        let mut app = app_with_target(&root, root.clone());
+
+        app.request_delete();
+
+        assert!(app.dialog.is_none(), "a drive root never opens a dialog");
+        assert_eq!(app.status, app.lang.t("status.delete_drive_refused"));
+    }
+
+    #[test]
+    fn compress_refuses_a_drive_root() {
+        let Some(root) = available_drives().first().cloned() else {
+            return; // no drive letters to test against (non-Windows)
+        };
+        let mut app = app_with_target(&root, root.clone());
+
+        app.compress("tar");
+
+        assert!(app.job.is_none(), "no job may start on a drive root");
+        assert_eq!(app.status, app.lang.t("status.compress_drive_refused"));
+    }
+
+    #[test]
+    fn extract_refuses_a_drive_root() {
+        let Some(root) = available_drives().first().cloned() else {
+            return; // no drive letters to test against (non-Windows)
+        };
+        let mut app = app_with_target(&root, root.clone());
+
+        app.extract();
+
+        assert!(app.job.is_none(), "no job may start on a drive root");
+        assert_eq!(app.status, app.lang.t("status.extract_drive_refused"));
+    }
+
+    #[test]
+    fn available_drives_is_sorted_and_deduplicated() {
+        let drives = available_drives();
+        let mut sorted = drives.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(drives, sorted, "the drive list must be sorted and deduplicated");
+
+        #[cfg(windows)]
+        for d in &drives {
+            let s = d.to_string_lossy();
+            assert_eq!(s.len(), 3, "a drive root is exactly `X:\\`: {s}");
+            assert_eq!(&s[1..3], ":\\", "{s}");
+            assert!(s.as_bytes()[0].is_ascii_uppercase(), "{s}");
+        }
+    }
+
+    #[test]
+    fn go_up_with_no_drives_does_not_open_an_empty_view() {
+        // The guard that keeps an empty enumeration from stranding the user on
+        // a dead screen: entering with nothing to show must leave the app alone
+        let mut app = App::new(Lang::builtin(), false);
+        app.current_dir = PathBuf::from(DRIVES_SENTINEL);
+        app.entries = vec![PathBuf::from("x.txt")];
+        app.enter_drives_view_with(Vec::new());
+        assert!(!app.at_drives, "an empty drive list must not open the view");
+        assert_eq!(app.entries, vec![PathBuf::from("x.txt")]);
+
+        // On platforms without drive letters the same rule holds through
+        // `go_up` at the filesystem root
+        #[cfg(not(windows))]
+        {
+            let mut app = App::new(Lang::builtin(), false);
+            app.current_dir = PathBuf::from("/");
+            app.go_up();
+            assert!(!app.at_drives);
+            assert_eq!(app.current_dir, PathBuf::from("/"));
+        }
     }
 }

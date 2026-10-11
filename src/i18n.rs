@@ -24,10 +24,31 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("panel.tree", "文件树", "檔案樹", "File Tree"),
     ("panel.info", "文件信息", "檔案資訊", "File Info"),
     ("panel.keys", "键位", "按鍵", "Keys"),
+    // The path panel's own label while the virtual drive list is shown
+    ("panel.this_pc", "此电脑", "本機", "This PC"),
     // ---- status bar ----
     ("status.label", "状态:", "狀態:", "Status:"),
     ("status.ready", "就绪", "就緒", "Ready"),
     ("status.entered", "进入", "進入", "Entered"),
+    ("status.entered_drive", "已进入盘 {0}", "已進入磁碟 {0}", "Entered drive {0}"),
+    (
+        "status.delete_drive_refused",
+        "不能删除整个盘",
+        "不能刪除整個磁碟",
+        "Cannot delete an entire drive",
+    ),
+    (
+        "status.compress_drive_refused",
+        "不能压缩整个盘",
+        "不能壓縮整個磁碟",
+        "Cannot compress an entire drive",
+    ),
+    (
+        "status.extract_drive_refused",
+        "不能解压盘根",
+        "不能解壓磁碟根目錄",
+        "Cannot extract a drive root",
+    ),
     ("status.job_running", "已有任务进行中", "已有任務進行中", "A task is already running"),
     ("status.nothing_selected", "没有选中文件", "沒有選中檔案", "Nothing selected"),
     (
@@ -119,6 +140,9 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ("value.dir", "目录", "目錄", "Directory"),
     ("value.file", "文件", "檔案", "File"),
     ("value.unknown", "未知", "未知", "Unknown"),
+    // A filesystem root has no meaningful total: a walk stops at the budget and
+    // would report a floor, which reads as a nearly-empty volume
+    ("value.size_not_applicable", "—", "—", "—"),
     // A directory sum that hit the walk budget is a floor, not a total
     ("value.size_partial", "{0}+", "{0}+", "{0}+"),
     // ---- file info panel ----
