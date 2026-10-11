@@ -25,14 +25,15 @@ use crate::{
 };
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
     // Read the language before the alternate screen goes up: a broken config
     // degrades to the built-in copy and says so in the status bar
-    let (lang, notice) = Lang::load();
+    let (lang, notice) = Lang::load(language_verify_enabled(&args));
     // Same reasoning for the icons: a terminal with no Nerd Font would draw
     // empty boxes, so the switch has to be settled before the first frame and
     // handed to the App rather than re-read while drawing
     let use_nerd_icons = nerd_icons_enabled(
-        &std::env::args().collect::<Vec<String>>(),
+        &args,
         std::env::var(NERD_ICONS_ENV).ok().as_deref(),
     );
 
@@ -60,6 +61,23 @@ const NERD_ICONS_ENV: &str = "LAZYZIP_NERD_ICONS";
 
 /// Command line flag that turns the Nerd Font icons off
 const NO_NERD_ICONS_FLAG: &str = "--no-nerd-icons";
+
+/// Command line flag that skips the language-config version check
+const NO_LANGUAGE_VERIFY_FLAG: &str = "--no-language-verify";
+
+/// Whether the language config's `version` is checked against the built-in
+/// table at startup.
+///
+/// On unless the flag is present. The flag is matched case-insensitively so
+/// both the all-caps and the conventional lower-case spelling work. Off
+/// means the config is read as-is, nothing is ever written or regenerated,
+/// and no prompt is produced - handlers that just want the copy without
+/// touching the disk
+fn language_verify_enabled(args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case(NO_LANGUAGE_VERIFY_FLAG))
+}
 
 /// Whether the listing leads its rows with Nerd Font glyphs.
 ///
@@ -217,5 +235,25 @@ mod tests {
         // in front of them, so it has the last word
         assert!(!nerd_icons_enabled(&args(&["--no-nerd-icons"]), Some("0")));
         assert!(!nerd_icons_enabled(&args(&["--no-nerd-icons"]), Some("1")));
+    }
+
+    #[test]
+    fn language_verification_is_on_unless_the_flag_is_given() {
+        // Nothing at all: the startup check is the point, so a plain run must
+        // verify and (re)generate the config
+        assert!(language_verify_enabled(&args(&[])));
+        // An unrelated flag must not switch it off by accident
+        assert!(language_verify_enabled(&args(&["--no-nerd-icons", "--lang", "en-us"])));
+    }
+
+    #[test]
+    fn either_casing_of_the_verify_flag_turns_verification_off() {
+        // Both the all-caps spelling the user asked for and the conventional
+        // lower-case one, plus a mixed form, all match case-insensitively
+        assert!(!language_verify_enabled(&args(&["--NO-LANGUAGE-VERIFY"])));
+        assert!(!language_verify_enabled(&args(&["--no-language-verify"])));
+        assert!(!language_verify_enabled(&args(&["--No-LaNgUaGe-VeRiFy"])));
+        // Position among other arguments must not matter
+        assert!(!language_verify_enabled(&args(&["--lang", "en-us", "--no-language-verify"])));
     }
 }

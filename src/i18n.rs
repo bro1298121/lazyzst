@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 /// Language used as the second step of the fallback chain
 pub(crate) const DEFAULT_LANG: &str = "en-us";
 
+/// Language tags that may be selected in the config file. Anything else is
+/// rejected when preserving a user's choice during a regeneration, so a
+/// typo in `current` quietly lands back on [`DEFAULT_LANG`]
+const SUPPORTED_LANGS: &[&str] = &["zh-cn", "zh-tw", "en-us"];
+
 /// Built-in copy: `(key, zh-cn, zh-tw, en-us)`.
 /// Placeholders are `{0}`, `{1}`, ... and are filled in by [`Lang::tf`].
 const BUILTIN: &[(&str, &str, &str, &str)] = &[
@@ -246,6 +251,36 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Content fingerprint of the built-in table. Any edit to any row changes
+/// the value, so a stored `version` never has to be bumped by hand: the
+/// number is derived from the copy itself.
+///
+/// The value is written into `language.json` as `version` and compared on
+/// the next startup. Files written by an older binary have no such field
+/// (it deserializes to 0) and therefore read as stale, which is exactly
+/// what we want: their copy predates the current table.
+pub(crate) fn builtin_fingerprint() -> u64 {
+    fingerprint_of(BUILTIN)
+}
+
+/// Hash every `(key, zh-cn, zh-tw, en-us)` row in table order into one
+/// number. Pure standard library, so the feature adds no dependency.
+/// Separate from [`builtin_fingerprint`] so tests can feed the same logic
+/// ad-hoc rows without touching the real table.
+fn fingerprint_of(rows: &[(&str, &str, &str, &str)]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    for (key, zh_cn, zh_tw, en_us) in rows {
+        key.hash(&mut hasher);
+        zh_cn.hash(&mut hasher);
+        zh_tw.hash(&mut hasher);
+        en_us.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Parsed `language.json`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Lang {
@@ -256,6 +291,11 @@ pub(crate) struct Lang {
     /// Language tag -> (key -> copy). A missing map deserializes to empty
     #[serde(default)]
     pub(crate) languages: HashMap<String, HashMap<String, String>>,
+    /// Fingerprint of the built-in table that generated this copy, written
+    /// by [`write_template`]. Missing on old files (defaults to 0) and
+    /// therefore read as stale, which triggers the silent regeneration
+    #[serde(default)]
+    pub(crate) version: u64,
 }
 
 fn default_current() -> String {
@@ -289,59 +329,107 @@ impl Lang {
         Self {
             current: DEFAULT_LANG.to_string(),
             languages,
+            version: builtin_fingerprint(),
         }
     }
 
     /// Load from `~/.config/lazyzst/language.json`, creating it with the
     /// built-in template when it does not exist yet.
     ///
-    /// Never panics. The second element is a status-bar notice for the caller
-    /// to show when something had to fall back
-    pub(crate) fn load() -> (Self, Option<String>) {
+    /// With `verify` set (the normal startup path) the copy on disk has to
+    /// match the fingerprint of the current built-in table. A missing,
+    /// unparseable, or stale file is silently regenerated from the table so
+    /// a newly added key can never stay absent from a user's copy; the
+    /// user's `current` language is preserved unless it is not one we know.
+    ///
+    /// Without `verify` (the `--no-language-verify` switch) the config is
+    /// read as-is and nothing is ever written: a missing or unreadable file
+    /// simply means the built-in copy runs in memory, and no notice is
+    /// produced either.
+    ///
+    /// Never panics. The second element is a status-bar notice for the
+    /// caller to show when a config file truly could not be read or written
+    pub(crate) fn load(verify: bool) -> (Self, Option<String>) {
+        Self::load_from(config_path(), verify)
+    }
+
+    /// [`Self::load`] with an explicit path, so tests can point at a
+    /// scratch directory instead of the real home directory
+    fn load_from(path: Option<PathBuf>, verify: bool) -> (Self, Option<String>) {
         // No home directory at all: stay in memory rather than guessing a path
-        let Some(path) = config_path() else {
+        let Some(path) = path else {
             return (Self::builtin(), None);
         };
 
         let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // First run: lay down the template so the file is editable
-                let lang = Self::builtin();
-                if let Err(err) = write_template(&path, &lang) {
-                    let notice = lang.config_notice(&path, &err.to_string());
-                    return (lang, Some(notice));
-                }
-                return (lang, None);
-            }
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                if !verify {
+                    return (Self::builtin(), None);
+                }
                 let lang = Self::builtin();
                 let notice = lang.config_notice(&path, &e.to_string());
                 return (lang, Some(notice));
             }
         };
 
-        Self::resolve(&text, &path)
+        match text {
+            None if !verify => (Self::builtin(), None),
+            None => {
+                // First run: lay down the template so the file is editable
+                let lang = Self::builtin();
+                if let Err(err) = write_template(&path, &lang) {
+                    let notice = lang.config_notice(&path, &err.to_string());
+                    return (lang, Some(notice));
+                }
+                (lang, None)
+            }
+            Some(text) if !verify => {
+                // Read the disk copy as it is: no version check, no write,
+                // and no prompt even when the file is broken
+                match Self::parse(&text) {
+                    Some(lang) => (lang, None),
+                    None => (Self::builtin(), None),
+                }
+            }
+            Some(text) => match Self::parse(&text) {
+                // Up to date: the user's file wins as-is
+                Some(user) if user.version == builtin_fingerprint() => (user, None),
+                // Stale but parseable: refresh it, keeping the language
+                Some(user) => Self::regenerate(&path, Some(&user)),
+                // Unparseable: rewrite the file from the table entirely
+                None => Self::regenerate(&path, None),
+            },
+        }
     }
 
-    /// Parse config text. Broken JSON yields `None` instead of panicking,
-    /// which is the common case when someone hand-edits the file
+    /// Rebuild the config file from the built-in table. `user`'s `current`
+    /// is carried over when present and supported; broken JSON sees it as
+    /// absent and lands on the default.
+    ///
+    /// A successful write is a silent refresh: outdated copy is normal and
+    /// nothing is wrong. Only a failed write is a real problem and earns a
+    /// notice
+    fn regenerate(path: &Path, user: Option<&Lang>) -> (Self, Option<String>) {
+        let mut lang = Self::builtin();
+        if let Some(user) = user
+            && SUPPORTED_LANGS.contains(&user.current.as_str())
+        {
+            lang.current = user.current.clone();
+        }
+        if let Err(err) = write_template(path, &lang) {
+            let notice = lang.config_notice(path, &err.to_string());
+            return (lang, Some(notice));
+        }
+        (lang, None)
+    }
+
+    /// Text -> `Lang`, or `None` for anything that does not parse as the
+    /// config shape. Broken JSON is handled by the load path (regenerated),
+    /// not here
     fn parse(text: &str) -> Option<Self> {
         serde_json::from_str(text).ok()
-    }
-
-    /// Text -> (language, optional notice). Anything unparseable falls back to
-    /// the built-in copy so the UI still has something to show
-    fn resolve(text: &str, path: &Path) -> (Self, Option<String>) {
-        // An empty file parses as "no current language" only if it is `{}`;
-        // blank text is a syntax error, and treating it as one keeps the
-        // "someone half-wrote the file" case on the same recovery path
-        if let Some(lang) = Self::parse(text) {
-            return (lang, None);
-        }
-        let lang = Self::builtin();
-        let notice = lang.config_notice(path, "invalid JSON");
-        (lang, Some(notice))
     }
 
     /// Human-readable notice about a config problem, already localized
@@ -507,14 +595,19 @@ mod tests {
     }
 
     #[test]
-    fn broken_json_falls_back_to_builtin_without_panicking() {
-        let (lang, notice) = Lang::resolve("{ this is not json", Path::new("language.json"));
+    fn broken_json_is_regenerated_instead_of_merely_falling_back() {
+        let s = scratch("broken-json");
+        let path = s.0.join("language.json");
+        fs::write(&path, "{ this is not json").expect("seed a broken config");
 
-        assert_eq!(lang, Lang::builtin(), "must fall back to the built-in copy");
-        let notice = notice.expect("a broken config should report a notice");
-        assert!(!notice.is_empty());
-        // The notice is itself localized, so it must not contain raw placeholders
-        assert!(!notice.contains("{0}"), "notice={notice}");
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert_eq!(lang, Lang::builtin(), "must run off the built-in copy");
+        assert!(notice.is_none(), "a healed file is silent, not an error");
+        // The disk copy was rewritten and now parses with the current version
+        let reparsed = Lang::parse(&fs::read_to_string(&path).expect("regenerated file"))
+            .expect("the regeneration must be valid JSON");
+        assert_eq!(reparsed, Lang::builtin());
+        assert_eq!(reparsed.version, builtin_fingerprint());
     }
 
     #[test]
@@ -600,5 +693,175 @@ mod tests {
         assert_eq!(path.file_name().unwrap(), "language.json", "{path:?}");
         assert_eq!(dir.file_name().unwrap(), "lazyzst", "{dir:?}");
         assert_eq!(dir.parent().unwrap().file_name().unwrap(), ".config");
+    }
+
+    #[test]
+    fn builtin_fingerprint_is_stable_for_the_same_table() {
+        // Same input, same process: the value never flickers
+        assert_eq!(builtin_fingerprint(), builtin_fingerprint());
+        assert_eq!(builtin_fingerprint(), fingerprint_of(BUILTIN));
+        // The fingerprint is embedded in the built-in copy, so the written
+        // template can never disagree with the running table
+        assert_eq!(Lang::builtin().version, builtin_fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_table_content_changes() {
+        let rows: &[(&str, &str, &str, &str)] = &[
+            ("a.b", "一", "一", "one"),
+            ("c.d", "二", "二", "two"),
+        ];
+        let base = fingerprint_of(rows);
+
+        // A single edited translation must move the fingerprint
+        let edited = fingerprint_of(&[("a.b", "一", "一", "one"), ("c.d", "二", "二", "TWO")]);
+        assert_ne!(base, edited);
+
+        // So must a brand-new row
+        let extended = fingerprint_of(&[
+            ("a.b", "一", "一", "one"),
+            ("c.d", "二", "二", "two"),
+            ("e.f", "三", "三", "three"),
+        ]);
+        assert_ne!(base, extended);
+    }
+
+    /// `current` written to the scratch config, alongside whatever else the
+    /// test wants in the file. A helper so the staleness cases read alike
+    fn seed_lang(path: &Path, json: &str) {
+        fs::write(path, json).expect("seed a language config");
+    }
+
+    #[test]
+    fn first_run_writes_the_template_with_the_current_version() {
+        let s = scratch("first-run");
+        // Nested path: the directory must be created by the loader itself
+        let path = s.0.join("nested").join("deeper").join("language.json");
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert_eq!(lang, Lang::builtin());
+        assert!(notice.is_none());
+
+        let reparsed =
+            Lang::parse(&fs::read_to_string(&path).expect("template written")).expect("valid JSON");
+        assert_eq!(reparsed.version, builtin_fingerprint());
+        assert_eq!(lang, reparsed);
+    }
+
+    #[test]
+    fn file_without_version_is_regenerated_keeping_the_language() {
+        // Old binaries never wrote a `version` field: serde defaults it to 0,
+        // which can never equal the current fingerprint
+        let s = scratch("no-version");
+        let path = s.0.join("language.json");
+        seed_lang(
+            &path,
+            r#"{"current":"zh-cn","languages":{"zh-cn":{"panel.path":"旧译文"}}}"#,
+        );
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert!(notice.is_none(), "an outdated copy is a silent refresh");
+        assert_eq!(lang.current(), "zh-cn", "the user's choice must survive");
+
+        let reparsed = Lang::parse(&fs::read_to_string(&path).expect("regenerated")).unwrap();
+        assert_eq!(reparsed.version, builtin_fingerprint());
+        // The applied table, not the stale file - the new key is present
+        assert_eq!(reparsed.languages["zh-cn"]["panel.path"], "路径");
+        assert_eq!(reparsed.languages["zh-cn"]["value.size_not_applicable"], "—");
+    }
+
+    #[test]
+    fn stale_version_is_regenerated_keeping_the_language() {
+        let s = scratch("stale-version");
+        let path = s.0.join("language.json");
+        seed_lang(
+            &path,
+            r#"{"version":1,"current":"zh-tw","languages":{"zh-tw":{"panel.path":"舊譯文"}}}"#,
+        );
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert!(notice.is_none());
+        assert_eq!(lang.current(), "zh-tw");
+
+        let reparsed = Lang::parse(&fs::read_to_string(&path).expect("regenerated")).unwrap();
+        assert_eq!(reparsed.version, builtin_fingerprint());
+        assert_eq!(reparsed.languages["zh-tw"]["panel.path"], "路徑");
+    }
+
+    #[test]
+    fn matching_version_leaves_the_file_alone() {
+        let s = scratch("fresh");
+        let path = s.0.join("language.json");
+        write_template(&path, &Lang::builtin()).expect("write a current template");
+        let original = fs::read_to_string(&path).expect("read back");
+        let mtime = fs::metadata(&path).expect("metadata").modified().expect("mtime");
+
+        // Give a would-be rewrite room to show up in the mtime
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert!(notice.is_none());
+        assert_eq!(lang, Lang::builtin());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read again"),
+            original,
+            "an up-to-date file must not be rewritten"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").modified().expect("mtime"),
+            mtime,
+            "the file's mtime must not move"
+        );
+    }
+
+    #[test]
+    fn unsupported_current_language_falls_back_to_the_default() {
+        let s = scratch("klingon");
+        let path = s.0.join("language.json");
+        seed_lang(&path, r#"{"version":0,"current":"klingon","languages":{}}"#);
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), true);
+        assert!(notice.is_none());
+        assert_eq!(lang.current(), DEFAULT_LANG, "a garbage tag cannot be kept");
+        // Default copy is fully populated, not the empty `languages` from disk
+        assert_eq!(lang.languages["en-us"]["panel.path"], "Path");
+    }
+
+    #[test]
+    fn skip_verify_never_writes_even_when_the_file_is_missing() {
+        let s = scratch("skip-missing");
+        let path = s.0.join("language.json");
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), false);
+        assert_eq!(lang, Lang::builtin());
+        assert!(notice.is_none());
+        assert!(!path.exists(), "skip mode must not lay down the template");
+    }
+
+    #[test]
+    fn skip_verify_reads_the_disk_copy_without_touching_it() {
+        let s = scratch("skip-stale");
+        let path = s.0.join("language.json");
+        seed_lang(
+            &path,
+            r#"{"current":"zh-cn","languages":{"zh-cn":{"panel.path":"旧"}}}"#,
+        );
+        let original = fs::read_to_string(&path).expect("read back");
+
+        let (lang, notice) = Lang::load_from(Some(path.clone()), false);
+        assert!(notice.is_none());
+        // No version check, no regeneration: the stale copy is used verbatim
+        assert_eq!(lang.current(), "zh-cn");
+        assert_eq!(lang.t("panel.path"), "旧");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read again"),
+            original,
+            "skip mode must never rewrite the file"
+        );
+
+        // The same file through the verified path regenerates, proving the
+        // difference is the switch rather than the file
+        let (lang, _) = Lang::load_from(Some(path.clone()), true);
+        assert_eq!(lang.t("panel.path"), "路径");
     }
 }
